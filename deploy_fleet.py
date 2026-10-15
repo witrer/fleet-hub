@@ -52,7 +52,7 @@ caddy=f'''{{
     encode zstd gzip
     header {{
         X-Content-Type-Options nosniff
-        Referrer-Policy no-referrer
+        Referrer-Policy same-origin
         X-Frame-Options DENY
     }}
     handle /internal/* {{

@@ -129,7 +129,9 @@ def install_oauth(app, cfg, root):
     auth = build_auth_settings(base, base + '/mcp')
     metadata_url = base + '/.well-known/oauth-protected-resource/mcp'
     challenge = 'Bearer resource_metadata="' + metadata_url + '", scope="mcp:tools"'
-    headers = {'Cache-Control': 'no-store', 'Pragma': 'no-cache', 'Referrer-Policy': 'no-referrer',
+    # no-referrer makes a browser's navigation POST send Origin: null. Keep the
+    # same-origin form identifiable while withholding its URL from the callback.
+    headers = {'Cache-Control': 'no-store', 'Pragma': 'no-cache', 'Referrer-Policy': 'same-origin',
                'X-Frame-Options': 'DENY',
                'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"}
 

@@ -81,6 +81,8 @@ def consent_form(client, response):
     response = client.get(location)
     assert response.status_code == 200
     assert OWNER not in response.text
+    # A native form POST must preserve Origin; no-referrer would send "null".
+    assert response.headers['referrer-policy'] == 'same-origin'
     cookie = response.headers.get('set-cookie', '').lower()
     assert 'secure' in cookie and 'httponly' in cookie and 'samesite=lax' in cookie
     fields = Inputs(response.text).values
@@ -180,7 +182,8 @@ def test_anonymous_authorize_requires_owner_consent(oauth):
     assert_oauth_error(result, 'invalid_grant')
 
 
-@pytest.mark.parametrize('change', ['missing_csrf', 'wrong_csrf', 'missing_cookie', 'wrong_origin'])
+@pytest.mark.parametrize('change', ['missing_csrf', 'wrong_csrf', 'missing_cookie',
+                                  'wrong_origin', 'missing_origin', 'null_origin'])
 def test_consent_rejects_csrf_and_origin(oauth, change):
     _, _, response = authorization(oauth)
     form = consent_form(oauth, response)
@@ -191,9 +194,13 @@ def test_consent_rejects_csrf_and_origin(oauth, change):
         form['csrf'] = 'wrong-csrf'
     elif change == 'missing_cookie':
         oauth.cookies.clear()
+    elif change == 'missing_origin':
+        origin = None
+    elif change == 'null_origin':
+        origin = 'null'
     else:
         origin = 'https://untrusted.test'
-    response = oauth.post('/oauth/consent', data=form, headers={'Origin': origin})
+    response = oauth.post('/oauth/consent', data=form, headers={'Origin': origin} if origin else {})
     assert response.status_code in (400, 401, 403, 422)
     assert OWNER not in response.text
     assert 'code' not in parse_qs(urlsplit(response.headers.get('location', '')).query)

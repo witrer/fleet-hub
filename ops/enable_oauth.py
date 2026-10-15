@@ -21,7 +21,7 @@ def main():
            '        }')
     internal_old = '    @internal path /internal/*\n    respond @internal 404'
     internal_new = '    handle /internal/* {\n        respond 404\n    }'
-    if new in original and internal_new in original:
+    if new in original and internal_new in original and 'Referrer-Policy no-referrer' not in original:
         print('Fleet OAuth gateway is already enabled')
         return
     if old not in original and new not in original:
@@ -41,7 +41,8 @@ def main():
         metadata = json.load(response)
         assert metadata['registration_endpoint'] and 'S256' in metadata['code_challenge_methods_supported']
     staged = caddyfile.with_name('Caddyfile.oauth-next')
-    updated = original.replace(old, new).replace(internal_old, internal_new)
+    updated = original.replace(old, new).replace(internal_old, internal_new).replace(
+        'Referrer-Policy no-referrer', 'Referrer-Policy same-origin')
     if internal_new not in updated:
         raise SystemExit('Internal route guard differs; inspect before migration')
     staged.write_text(updated)
