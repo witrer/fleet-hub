@@ -133,3 +133,24 @@ def test_transfer_expiry_uses_target_local_time_for_openssh_89(hub, monkeypatch)
     assert commands[0].startswith('date -d @')
     assert 'expiry-time="20261016124500"' in commands[1]
     assert '20261016124500Z' not in commands[1]
+
+
+def test_agent_release_matches_the_downloaded_script(hub):
+    import hashlib
+    _, client, _ = hub
+    release=client.get('/api/agent-release')
+    assert release.status_code==200
+    payload=release.json()
+    downloaded=client.get('/node.py')
+    assert hashlib.sha256(downloaded.content).hexdigest()==payload['sha256']
+    assert payload['version']==payload['sha256'][:12]
+    assert payload['url']=='https://hub.test/node.py'
+
+
+@pytest.mark.parametrize('path', ['/install.sh', '/send.sh', '/send.ps1'])
+def test_one_command_launchers_use_the_configured_hub(hub, path):
+    _, client, _ = hub
+    response = client.get(path)
+    assert response.status_code == 200
+    assert 'https://hub.test' in response.text
+    assert '__HUB_URL__' not in response.text

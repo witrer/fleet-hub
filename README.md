@@ -8,15 +8,15 @@
 
 ### 接入服务器
 
-在 WebUI 输入中枢 Bearer Token，点击 **接入服务器** 并填写名称，将生成的命令粘贴到目标服务器终端：
+在 WebUI 输入中枢访问令牌，然后按 **接入服务器 → 填写名称 → 复制一条命令** 操作，在目标服务器终端执行一次：
 
 ```bash
 curl -fsSL https://YOUR_HUB/install.sh | bash -s -- '<一次性注册令牌>'
 ```
 
-注册命令单次有效、30 分钟过期。目标节点支持 Linux amd64 / arm64，需要 `curl`、Python 3 和 SSH 服务。以希望 Agent 使用的用户执行；注册程序会安装隧道与探针、写入中枢 SSH 公钥，并自动更新 MCP 清单。
+程序会自动识别目标服务器环境，准备所需依赖、安装隧道与探针、完成注册并常驻运行。节点掉线会自动重连，每 10 分钟自动检查探针更新，无需手动下载客户端或管理运行环境。
 
-root + systemd 环境会建立 `fleet-node.service` 并开机启动；其他环境使用后台进程。SSH 非默认端口时，执行命令前设置 `FLEET_SSH_PORT`。
+注册命令单次有效、30 分钟过期，目标节点支持 Linux amd64 / arm64。以希望 Agent 使用的用户执行；接入完成后，节点会自动显示在探针面板与 MCP 清单中。程序会按运行环境建立常驻方式；systemd 环境启用开机启动。SSH 非默认端口时，执行命令前设置 `FLEET_SSH_PORT`。
 
 ### 连接 Agent
 
@@ -37,16 +37,25 @@ root + systemd 环境会建立 `fleet-node.service` 并开机启动；其他环�
 
 ### 上传数据集
 
-下载中枢提供的 `/transfer.py`，在本机设置环境变量 `FLEET_TOKEN`，运行：
+在面板下方的 **一键上传命令** 中，选择目标服务器，填入本机文件或目录路径、服务器保存路径，复制命令并在本机终端执行。面板自动选择当前系统对应的命令，也可切换终端类型。
+
+Linux / macOS：
 
 ```bash
-uv run transfer.py --hub https://YOUR_HUB --node node-xxxxxxxxxx \
-  --source ./dataset --destination /data/dataset
+curl -fsSL https://YOUR_HUB/send.sh | bash -s -- --node node-xxxxxxxxxx --source ./dataset --destination /data/dataset
 ```
 
-客户端通过 PEP 723 声明自动准备依赖，使用独立临时 SSH 密钥建立 XTCP 直连。面板显示字节数、进度、平均速度和失败原因。文件内容不通过中枢转发。
+Windows PowerShell：
 
-直连打洞重试窗口约 60 秒，SSH 握手及认证各最多等待 15 秒；失败即停止，不回退到中枢中继。当前支持文件与目录上传，不支持断点续传或符号链接。覆盖同名文件需显式添加 `--overwrite`。
+```powershell
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://YOUR_HUB/send.ps1').Content)) -Node node-xxxxxxxxxx -Source 'D:\datasets\dataset' -Destination /data/dataset
+```
+
+命令会自动准备上传工具。首次执行时按提示输入中枢访问令牌，程序将授权保存到本机，之后直接使用。无需手动设置环境变量或下载安装运行时。
+
+上传通过独立临时 SSH 密钥建立 XTCP 直连，文件内容不通过中枢转发。面板显示字节数、进度、平均速度和失败原因。
+
+直连打洞重试窗口约 60 秒，SSH 握手及认证各最多等待 15 秒；失败即停止，不回退到中枢中继。当前支持文件与目录上传，不支持断点续传或符号链接。覆盖同名文件可勾选面板中的替换选项，或在命令后添加 `--overwrite`（Linux / macOS）或 `-Overwrite`（PowerShell）。
 
 ### 节点在线状态
 
@@ -64,7 +73,7 @@ git commit -m "Describe the change"
 git push origin main
 ```
 
-中枢每 10 分钟检查 `main`，有新提交时发布 `app/` 和 `wheels/`。自动更新范围为中枢应用与 Relay Shell wheel；操作系统、frp、Caddy 和基础 Python 环境由单独的运维操作管理。目标服务器已经安装的探针不在此次自动发布范围内；新注册节点和重新下载的传输客户端使用中枢提供的新版本。
+中枢每 10 分钟检查 `main`，有新提交时发布 `app/` 和 `wheels/`。常驻节点每 10 分钟向中枢检查探针新版本；上传命令会自动使用中枢提供的最新工具。操作系统、frp 和 Caddy 由单独的运维操作管理。
 
 WebUI 的 **中枢更新** 区域显示当前提交短 SHA、最近检查时间、部署结果及失败说明。更新器记录在 `/var/lib/fleet/update-status.json`，仅经过管理员鉴权的 `/api/state` 会返回这些信息。状态文件缺失或暂时不可读时，不影响节点、SSH 和探针接口。
 
@@ -131,6 +140,7 @@ systemctl enable --now fleet-update.timer
 | `app/mcp_entry.py` | Relay Shell 与 Fleet 节点工具 |
 | `app/static/index.html` | 无构建依赖的中文 WebUI |
 | `app/static/node.py` | Linux 节点安装及探针 |
+| `app/static/send.sh`、`app/static/send.ps1` | 一条命令上传的系统适配与启动入口 |
 | `app/static/transfer.py` | 本地 XTCP 传输客户端 |
 | `app/assets.json` | frp 下载文件名与 SHA-256 |
 | `deploy_fleet.py` | 初始服务和系统配置生成 |

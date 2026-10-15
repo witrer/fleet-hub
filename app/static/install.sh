@@ -1,9 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
-HUB='__HUB_URL__'
-TOKEN="${1:?需要一次性注册令牌}"
-command -v python3 >/dev/null || { echo '需要 Python 3'; exit 1; }
-TMP=$(mktemp)
+umask 077
+HUB="${FLEET_HUB:-__HUB_URL__}"
+ROOT="${FLEET_NODE_DIR:-$HOME/.local/share/fleet-node}"
+TOKEN="${1:-}"
+export FLEET_NODE_DIR="$ROOT"
+mkdir -p "$ROOT/runtime"
+usable_python() { "$1" -c 'import sys,ssl,urllib.request; assert sys.version_info >= (3,8)' >/dev/null 2>&1; }
+PYTHON=''
+for candidate in "${FLEET_PYTHON:-python3}" python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 && usable_python "$candidate"; then
+    PYTHON=$(command -v "$candidate"); break
+  fi
+done
+if [ -z "$PYTHON" ] && [ "$(id -u)" = 0 ]; then
+  echo '正在自动安装运行环境…'
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y -qq python3 ca-certificates || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y python3 ca-certificates || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y python3 ca-certificates || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache python3 ca-certificates || true
+  fi
+  if command -v python3 >/dev/null 2>&1 && usable_python python3; then PYTHON=$(command -v python3); fi
+fi
+if [ -z "$PYTHON" ]; then
+  case "$(uname -m)" in
+    x86_64) UV_ARCH=x86_64; UV_SHA=6c86040a8f045ab9adc9e3ec4cdafa03fd00e9a988ed2bf28971c7fc2d0debd0 ;;
+    aarch64|arm64) UV_ARCH=aarch64; UV_SHA=345a8308e4d1835cdfaadf692836fd3137a6d45864773f05ad7bf59442b1ba16 ;;
+    *) echo '支持 Linux amd64/arm64'; exit 1 ;;
+  esac
+  echo '正在自动准备用户运行环境…'
+  if [ ! -x "$ROOT/runtime/uv" ]; then
+    UV_ARCHIVE=$(mktemp "$ROOT/runtime/uv.XXXXXX")
+    curl -fSL --connect-timeout 15 --max-time 120 --retry 2 "https://gh-proxy.org/https://github.com/astral-sh/uv/releases/download/0.13.1/uv-${UV_ARCH}-unknown-linux-musl.tar.gz" -o "$UV_ARCHIVE" || \
+      curl -fSL --retry 3 "$HUB/downloads/uv-0.13.1-${UV_ARCH}-unknown-linux-musl.tar.gz" -o "$UV_ARCHIVE"
+    echo "$UV_SHA  $UV_ARCHIVE" | sha256sum -c -
+    tar -xzf "$UV_ARCHIVE" -C "$ROOT/runtime" --strip-components=1 "uv-${UV_ARCH}-unknown-linux-musl/uv"
+    rm -f "$UV_ARCHIVE"
+  fi
+  export UV_PYTHON_INSTALL_DIR="$ROOT/runtime/python"
+  export UV_CACHE_DIR="$ROOT/runtime/cache"
+  "$ROOT/runtime/uv" python install 3.12 --no-bin --mirror 'https://gh-proxy.org/https://github.com/astral-sh/python-build-standalone/releases/download'
+  PYTHON=$("$ROOT/runtime/uv" python find --managed-python 3.12)
+fi
+TMP=$(mktemp "$ROOT/node-install.XXXXXX.py")
 trap 'rm -f "$TMP"' EXIT
-curl -fsSL "$HUB/node.py" -o "$TMP"
-python3 "$TMP" install --hub "$HUB" --token "$TOKEN"
+curl -fsSL --retry 3 "$HUB/node.py" -o "$TMP"
+"$PYTHON" - "$HUB" "$TMP" <<'PY'
+import hashlib,json,pathlib,sys,urllib.request
+with urllib.request.urlopen(sys.argv[1]+'/api/agent-release',timeout=30) as response:
+    release=json.load(response)
+source=pathlib.Path(sys.argv[2]).read_bytes()
+if hashlib.sha256(source).hexdigest()!=release['sha256']:
+    raise SystemExit('节点程序下载校验失败，请重新执行安装命令')
+compile(source, 'node.py', 'exec')
+PY
+"$PYTHON" "$TMP" install --hub "$HUB" --token "$TOKEN"

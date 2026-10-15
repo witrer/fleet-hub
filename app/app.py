@@ -81,9 +81,19 @@ async def index(): return FileResponse(CODE/'static'/'index.html')
 async def health(): return {'ok':True}
 @app.get('/install.sh')
 async def installer():
-    return PlainTextResponse((CODE/'static'/'install.sh').read_text().replace('__HUB_URL__',BASE))
+    return PlainTextResponse((CODE/'static'/'install.sh').read_text(encoding='utf-8').replace('__HUB_URL__',BASE))
 @app.get('/node.py')
 async def agent_script(): return FileResponse(CODE/'static'/'node.py',media_type='text/x-python')
+@app.get('/api/agent-release')
+async def agent_release():
+    checksum=hashlib.sha256((CODE/'static'/'node.py').read_bytes()).hexdigest()
+    return {'version':checksum[:12],'url':BASE+'/node.py','sha256':checksum}
+@app.get('/send.sh')
+async def send_shell():
+    return PlainTextResponse((CODE/'static'/'send.sh').read_text(encoding='utf-8').replace('__HUB_URL__',BASE))
+@app.get('/send.ps1')
+async def send_powershell():
+    return PlainTextResponse((CODE/'static'/'send.ps1').read_text(encoding='utf-8').replace('__HUB_URL__',BASE))
 @app.get('/transfer.py')
 async def transfer_script(): return FileResponse(CODE/'static'/'transfer.py',media_type='text/x-python',filename='transfer.py')
 app.mount('/downloads',StaticFiles(directory=CODE/'downloads'),name='downloads')
@@ -167,7 +177,7 @@ allowUsers = ["*"]
 @app.post('/api/nodes/{node_id}/heartbeat')
 async def heartbeat(node_id:str,request:Request):
     node_auth(request,node_id); data=await request.json()
-    metrics={k:data[k] for k in ('cpu_percent','memory_percent','disk_percent','uptime','platform','load','network_rx','network_tx') if k in data}
+    metrics={k:data[k] for k in ('cpu_percent','memory_percent','disk_percent','uptime','platform','load','network_rx','network_tx','agent_version') if k in data}
     db.execute('UPDATE nodes SET last_seen=?,metrics=? WHERE id=?',(time.time(),json.dumps(metrics),node_id)); db.commit()
     return {'ok':True}
 
