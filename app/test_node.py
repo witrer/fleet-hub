@@ -39,6 +39,48 @@ def wait_for(predicate, timeout=12):
 
 
 class NodeTests(unittest.TestCase):
+    def test_one_command_installer_preserves_token_arguments(self):
+        # Exercise Bash and the real node CLI, replacing only installation side effects.
+        source = SOURCE.read_text().replace(
+            "if __name__ == '__main__':",
+            "def install(args):\n    print(json.dumps(vars(args)))\n\nif __name__ == '__main__':",
+        ).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+
+            def do_GET(self):
+                payload = source if self.path == '/node.py' else json.dumps({
+                    'sha256': hashlib.sha256(source).hexdigest(),
+                }).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                hub = 'http://127.0.0.1:' + str(server.server_port)
+                env = {**os.environ, 'FLEET_HUB': hub, 'FLEET_NODE_DIR': folder,
+                       'FLEET_PYTHON': sys.executable}
+                for token in ('ordinary_test_token', '-synthetic_test_token', '--help', ''):
+                    with self.subTest(token=token):
+                        result = subprocess.run(
+                            ['bash', '-s', '--', token],
+                            input=SOURCE.with_name('install.sh').read_bytes(),
+                            env=env, capture_output=True, timeout=20,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr.decode())
+                        self.assertEqual(json.loads(result.stdout), {
+                            'action': 'install', 'hub': hub, 'token': token,
+                        })
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_repair_legacy_registration_without_consuming_token(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

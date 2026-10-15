@@ -59,4 +59,4 @@ if hashlib.sha256(source).hexdigest()!=release['sha256']:
     raise SystemExit('节点程序下载校验失败，请重新执行安装命令')
 compile(source, 'node.py', 'exec')
 PY
-"$PYTHON" "$TMP" install --hub "$HUB" --token "$TOKEN"
+"$PYTHON" "$TMP" install --hub "$HUB" --token="$TOKEN"
