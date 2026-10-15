@@ -5,6 +5,7 @@ import asyncssh, httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from fleet_oauth import install_oauth
 
 ROOT = Path(os.environ.get('FLEET_ROOT', '/var/lib/fleet'))
 CODE = Path(__file__).parent
@@ -74,6 +75,7 @@ async def lifespan(app):
     with contextlib.suppress(asyncio.CancelledError): await task
 
 app = FastAPI(lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+install_oauth(app, CFG, ROOT)
 
 @app.get('/')
 async def index(): return FileResponse(CODE/'static'/'index.html')

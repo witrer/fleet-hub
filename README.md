@@ -20,6 +20,12 @@ curl -fsSL https://YOUR_HUB/install.sh | bash -s -- '<一次性注册令牌>'
 
 ### 连接 Agent
 
+ChatGPT 网页版添加自定义 MCP 时，填写 `https://YOUR_HUB/mcp`，鉴权选择 **OAuth**，Client ID 与 Client Secret 留空，由客户端动态注册。授权页输入 Fleet 面板访问令牌后确认连接。访问令牌只用于 Fleet 验证身份，不会交给 ChatGPT；OAuth 使用 PKCE、短期访问令牌和可轮换的刷新令牌，权限为 `mcp:tools`。
+
+已部署的旧版中枢先更新应用，再以 root 执行当前仓库的 `ops/enable_oauth.py`，将 Caddy 切换到 OAuth 验证入口。新安装会直接启用。OAuth 客户端和令牌保存在运行目录的 `oauth/`，与代码发布分离。
+
+Codex 等支持自定义请求头的客户端也可继续使用：
+
 | 配置 | 内容 |
 | --- | --- |
 | 传输 | Streamable HTTP |

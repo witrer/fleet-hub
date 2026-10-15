@@ -58,8 +58,9 @@ caddy=f'''{{
     @internal path /internal/*
     respond @internal 404
     handle /mcp* {{
-        @unauthorized not header Authorization "Bearer {cfg['admin_token']}"
-        respond @unauthorized "Authentication required" 401
+        forward_auth 127.0.0.1:8090 {{
+            uri /internal/mcp-auth
+        }}
         reverse_proxy 127.0.0.1:8080 {{
             header_up Host {{upstream_hostport}}
         }}
