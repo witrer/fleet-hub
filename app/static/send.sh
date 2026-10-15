@@ -9,20 +9,22 @@ uv_version='0.13.1'
 node=''
 source_path=''
 destination=''
+connect_timeout=180
 overwrite=()
 
 fail() { printf 'Fleet: %s\n' "$*" >&2; exit 1; }
 usage() {
-    printf '%s\n' '用法: --node 节点ID --source 本地路径 --destination 远端路径 [--overwrite]'
+    printf '%s\n' '用法: --node 节点ID --source 本地路径 --destination 远端路径 [--connect-timeout 秒数] [--overwrite]'
 }
 while (($#)); do
     case "$1" in
-        --node|--source|--destination)
+        --node|--source|--destination|--connect-timeout)
             (($# >= 2)) || fail "$1 缺少参数"
             case "$1" in
                 --node) node=$2 ;;
                 --source) source_path=$2 ;;
                 --destination) destination=$2 ;;
+                --connect-timeout) connect_timeout=$2 ;;
             esac
             shift 2 ;;
         --overwrite) overwrite=(--overwrite); shift ;;
@@ -31,6 +33,7 @@ while (($#)); do
     esac
 done
 [[ -n "$node" && -n "$source_path" && -n "$destination" ]] || { usage >&2; exit 2; }
+[[ "$connect_timeout" =~ ^[1-9][0-9]*$ ]] || fail '--connect-timeout 必须为正整数秒数'
 [[ -e "$source_path" ]] || fail "本地路径不存在: $source_path"
 case "$hub" in https://*|http://127.0.0.1:*|http://localhost:*) ;; *) fail '启动脚本缺少有效中枢地址' ;; esac
 for program in curl tar; do command -v "$program" >/dev/null || fail "系统缺少 $program"; done
@@ -121,4 +124,4 @@ export UV_PYTHON_INSTALL_MIRROR='https://gh-proxy.org/https://github.com/astral-
 export PYTHONUTF8=1
 printf '%s\n' '正在连接目标服务器并上传；运行环境和依赖会自动准备。'
 "$uv_bin" run --no-config --no-project --managed-python --python 3.12 --script "$config_dir/transfer.py" \
-    --hub "$hub" --node "$node" --source "$source_path" --destination "$destination" "${overwrite[@]}"
+    --hub "$hub" --node "$node" --source "$source_path" --destination "$destination" --connect-timeout "$connect_timeout" "${overwrite[@]}"

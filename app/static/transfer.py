@@ -219,9 +219,9 @@ def host_key(value: str) -> paramiko.PKey:
     return paramiko.PKey.from_type_string(key_type, base64.b64decode(key_data, validate=True))
 
 
-def connect_direct(job: dict, key: paramiko.PKey, port: int, process: subprocess.Popen, log_path: Path) -> paramiko.SSHClient:
+def connect_direct(job: dict, key: paramiko.PKey, port: int, process: subprocess.Popen, log_path: Path, connect_timeout: int = 180) -> paramiko.SSHClient:
     pinned_key = host_key(job["ssh_host_key"])
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + connect_timeout
     last_error = "direct tunnel is not ready"
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -231,20 +231,25 @@ def connect_direct(job: dict, key: paramiko.PKey, port: int, process: subprocess
         client.get_host_keys().add(f"[127.0.0.1]:{port}", pinned_key.get_name(), pinned_key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
         try:
-            remaining = min(5, max(0.1, deadline - time.monotonic()))
+            remaining = max(0.1, deadline - time.monotonic())
             client.connect("127.0.0.1", port=port, username=job["ssh_user"], pkey=key,
-                           timeout=remaining, banner_timeout=15, auth_timeout=15,
+                           timeout=min(5, remaining), banner_timeout=min(15, remaining), auth_timeout=min(15, remaining),
                            allow_agent=False, look_for_keys=False)
             client.get_transport().set_keepalive(10)
             return client
-        except (paramiko.BadHostKeyException, paramiko.AuthenticationException):
+        except paramiko.AuthenticationException as exc:
             client.close()
-            raise
+            raise RuntimeError("Direct tunnel reached SSH, but SSH authentication failed: " + str(exc)) from exc
+        except paramiko.BadHostKeyException as exc:
+            client.close()
+            raise RuntimeError("Direct tunnel reached SSH, but the SSH host key did not match") from exc
         except (OSError, EOFError, paramiko.SSHException) as exc:
             last_error = str(exc)
             client.close()
             time.sleep(0.3)
-    raise RuntimeError("P2P tunnel did not become ready after 60 seconds; no relay fallback was used. " + last_error)
+    log = log_path.read_text(errors="replace")
+    stage = "SSH handshake over the direct tunnel" if "establishing nat hole connection successful" in log else "P2P UDP hole punching"
+    raise RuntimeError(f"Timed out after {connect_timeout} seconds waiting for {stage}; no relay fallback was used. " + last_error)
 
 
 def stat_optional(sftp: paramiko.SFTPClient, path: str):
@@ -336,8 +341,11 @@ def main() -> int:
     parser.add_argument("--node", required=True)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--destination", required=True, help="Remote POSIX path; directory sources are copied into this path")
+    parser.add_argument("--connect-timeout", type=int, default=180, help="Seconds to allow P2P/SSH connection attempts (default: 180)")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    if args.connect_timeout <= 0:
+        parser.error("--connect-timeout must be a positive number of seconds")
     token = os.environ.get("FLEET_TOKEN", "")
     if not token:
         parser.error("Set the FLEET_TOKEN environment variable to your hub access token")
@@ -371,7 +379,8 @@ def main() -> int:
                 process = subprocess.Popen([str(binary), "-c", str(config)], stdout=log, stderr=subprocess.STDOUT,
                                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 try:
-                    client = connect_direct(job, ssh_key, port, process, log_path)
+                    print(f"Waiting up to {args.connect_timeout} seconds for P2P/SSH connection.", flush=True)
+                    client = connect_direct(job, ssh_key, port, process, log_path, args.connect_timeout)
                     print("Direct SSH connection established; uploading.", flush=True)
                     upload(client, job, source, files, directories, args.destination, args.overwrite, progress)
                     progress.finish("completed")

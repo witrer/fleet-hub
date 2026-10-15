@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Node,
     [Parameter(Mandatory = $true)][string]$Source,
     [Parameter(Mandatory = $true)][string]$Destination,
+    [ValidateRange(1, 2147483647)][int]$ConnectTimeout = 180,
     [switch]$Overwrite
 )
 
@@ -141,7 +142,7 @@ try {
     $env:UV_PYTHON_INSTALL_MIRROR = 'https://gh-proxy.org/https://github.com/astral-sh/python-build-standalone/releases/download'
     $env:PYTHONUTF8 = '1'
     $runArguments = @('run','--no-config','--no-project','--managed-python','--python','3.12','--script',
-        $scriptPath,'--hub',$hub,'--node',$Node,'--source',$sourcePath,'--destination',$Destination)
+        $scriptPath,'--hub',$hub,'--node',$Node,'--source',$sourcePath,'--destination',$Destination,'--connect-timeout',"$ConnectTimeout")
     if ($Overwrite) { $runArguments += '--overwrite' }
     Write-Host '正在连接目标服务器并上传；运行环境和依赖会自动准备。'
     & $uvBinary @runArguments

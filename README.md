@@ -24,7 +24,9 @@ ChatGPT 网页版添加自定义 MCP 时，填写 `https://YOUR_HUB/mcp`，鉴�
 
 已部署的旧版中枢先更新应用，再以 root 执行当前仓库的 `ops/enable_oauth.py`，将 Caddy 切换到 OAuth 验证入口。新安装会直接启用。OAuth 客户端和令牌保存在运行目录的 `oauth/`，与代码发布分离。
 
-需要为 OAuth 使用独立域名时，在运行目录 `config.json` 设置 `oauth_base_url`（例如 `https://fleet.example.com`），并在 Caddy 配置对应域名与可信证书。面板返回的 MCP URL、OAuth 发现、授权页与令牌资源使用该地址；节点安装、下载和更新继续使用原 `base_url`，已接入节点无需重新注册。切换 OAuth 地址后，在客户端重新连接以获取面向新资源的令牌；使用新连接页面生成的准确回调地址。重跑初始部署脚本前应保留自定义 Caddy 域名配置。
+需要为 OAuth 使用独立域名时，在运行目录 `config.json` 设置 `oauth_base_url`（例如 `https://fleet.example.com`）。面板返回的 MCP URL、OAuth 发现、授权页与令牌资源使用该地址；节点安装、下载和更新继续使用原 `base_url`，已接入节点无需重新注册。保存配置时保留原服务账号的文件所有权和 `0600` 权限，然后重启 `fleet-hub`。切换 OAuth 地址后，在客户端重新连接以获取面向新资源的令牌；使用新连接页面生成的准确回调地址。
+
+使用 Cloudflare Named Tunnel 时，将公开域名路由到现有 Caddy：服务填 `https://127.0.0.1:443`，附加设置中的 **Origin Server Name** 和 **HTTP Host Header** 均填写现有 Caddy 证书对应的中枢 IP 或域名，保留 TLS 证书验证。`cloudflared` 通过受限权限令牌文件运行并由 systemd 常驻；无需新增入站端口。先验证公开域名回源成功，再切换 `oauth_base_url`。若直接将域名解析到中枢，则需要在 Caddy 配置对应域名与可信证书；重跑初始部署脚本前应保留自定义 Caddy 配置。
 
 Codex 等支持自定义请求头的客户端也可继续使用：
 
@@ -63,7 +65,7 @@ Windows PowerShell：
 
 上传通过独立临时 SSH 密钥建立 XTCP 直连，文件内容不通过中枢转发。面板显示字节数、进度、平均速度和失败原因。
 
-直连打洞重试窗口约 60 秒，SSH 握手及认证各最多等待 15 秒；失败即停止，不回退到中枢中继。当前支持文件与目录上传，不支持断点续传或符号链接。覆盖同名文件可勾选面板中的替换选项，或在命令后添加 `--overwrite`（Linux / macOS）或 `-Overwrite`（PowerShell）。
+直连打洞与 SSH 建连默认最多重试 180 秒，可用 `--connect-timeout 300`（Linux / macOS）或 `-ConnectTimeout 300`（PowerShell）延长；失败会区分 P2P 打洞、SSH 握手与认证阶段，不回退到中枢中继。当前支持文件与目录上传，不支持断点续传或符号链接。覆盖同名文件可勾选面板中的替换选项，或在命令后添加 `--overwrite`（Linux / macOS）或 `-Overwrite`（PowerShell）。
 
 ### 节点在线状态
 
