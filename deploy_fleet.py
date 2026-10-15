@@ -55,8 +55,9 @@ caddy=f'''{{
         Referrer-Policy no-referrer
         X-Frame-Options DENY
     }}
-    @internal path /internal/*
-    respond @internal 404
+    handle /internal/* {{
+        respond 404
+    }}
     handle /mcp* {{
         forward_auth 127.0.0.1:8090 {{
             uri /internal/mcp-auth

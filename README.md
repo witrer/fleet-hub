@@ -67,6 +67,29 @@ Windows PowerShell：
 
 探针每 10 秒上报；最近心跳不足 35 秒且 frp SSH 代理为 `online` 时，节点显示在线。WebUI 每 5 秒刷新。传输任务超过 90 秒未更新进度，会标记为失败。
 
+### 探针面板
+
+浅色面板提供 CPU、内存、根磁盘和 GPU 四个环形仪表，点击可展开 1h / 6h / 24h 的真实历史曲线。内存和磁盘显示已用/总容量；多 GPU 可切换整体平均核心占用或单卡。无 GPU 显示 `—`，驱动不可用、权限不足和采集失败分别显示状态，探针不安装显卡驱动。
+
+**延迟是节点到中枢的 HTTPS 心跳请求 RTT**，使用单调时钟计时，在下一次心跳上传结果。它与 ICMP ping、SSH 隧道 RTT 是不同指标。每卡的 96 根条对应 UTC 对齐的 15 分钟桶，含当前正在增长的桶；Tooltip 按浏览器时区显示时间。均值和 P95 由真实成功样本计算，失败计入样本数，明确离线、未知时段分别显示深灰和浅灰。延迟摘要每 45 秒更新，已展开历史每 60 秒更新。
+
+默认资源提醒/严重阈值为 75% / 90%，延迟 P95 正常/偏高上限为 100ms / 250ms；在“设置”中可调整全局或某个节点的阈值，保存到当前浏览器，节点恢复默认后重新继承全局值。告警中心汇总当前观测，未配置站外通知。页面失去连接时保留上次数据并标明过期。
+
+在节点菜单或“节点管理”中编辑国家代码、地区和城市。人工设置优先于节点上报，未知地区不进行猜测；未提供公网 IP 时显示未知。地区不参与身份验证。
+
+历史保存到现有 SQLite 数据库，按分钟聚合资源，保留 RTT 原始样本以计算精确 P95。记录至少保留 48 小时，每小时清理。服务重启保留历史；没有观测的时间段返回 `null`，不插值。节点撤销后立即停止通过 API 展示其历史，记录继续按保留期清理。
+
+所有管理 API 使用原管理员 Bearer；节点凭据只能上传自身心跳：
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/state` | 最新指标、GPU、容量、地区、RTT 和 `freshness` |
+| `GET /api/nodes/{id}/history?metric=cpu&range=1h` | `cpu/memory/disk/gpu`、`1h/6h/24h`，GPU 可附 `device=0` |
+| `GET /api/latency/summary?range=24h&bucket=15m` | 所有活动节点各 96 桶，样本数、成功数、均值/P95、原因 |
+| `PUT /api/nodes/{id}/location` | 完整替换 `country_code/country_name/region/city`，空字符串清空 |
+
+老探针的心跳负载继续兼容，缺少的新指标保持未知；节点自动更新后开始上报新字段。
+
 ## 仓库与自动发布
 
 公开仓库为 [witrer/fleet-hub](https://github.com/witrer/fleet-hub)，默认发布分支 `main`。中枢通过 GitHub 加速镜像 `https://gh-proxy.org/https://github.com/witrer/fleet-hub.git` 拉取，无需 Token 或 Deploy Key。镜像 URL 格式见 [GH-Proxy 官方使用指南](https://gh-proxy.com/docs/github-accelerator/)。
@@ -143,6 +166,8 @@ systemctl enable --now fleet-update.timer
 | 路径 | 用途 |
 | --- | --- |
 | `app/app.py` | 注册、探针、传输状态和 frp 鉴权 API |
+| `app/probe.py` | 分钟历史、延迟聚合和地区配置 |
+| `app/fleet_oauth.py` | OAuth 发现、注册、所有者授权及 MCP 鉴权 |
 | `app/mcp_entry.py` | Relay Shell 与 Fleet 节点工具 |
 | `app/static/index.html` | 无构建依赖的中文 WebUI |
 | `app/static/node.py` | Linux 节点安装及探针 |
@@ -162,7 +187,7 @@ frp 下载包不提交 Git；生产环境保留 `/opt/fleet/app/downloads`。仓
 Python 3.12 或更新的兼容环境中，安装项目 wheel、FastAPI、HTTPX 和 pytest 后运行：
 
 ```bash
-python -m pytest app/test_app.py -q
+python -m pytest app/test_app.py app/test_oauth.py app/test_probe.py app/test_probe_api.py app/test_node.py app/test_node_metrics.py -q
 ```
 
 中枢健康检查为 `/health`；实际节点状态、SSH 可用性和更新结果通过鉴权 MCP 或 WebUI 查看。

@@ -12,7 +12,6 @@
 | `patches/relay-inventory-hot-reload.patch` | Relay Shell 服务器清单热更新补丁及相关测试 |
 | `wheels/relay_shell-0.4.0-py3-none-any.whl` | 包含热更新补丁的 Relay Shell 构建产物 |
 | `licenses/` | 上游许可证与 Relay Shell NOTICE |
-| `SHA256SUMS` | 本包各文件的 SHA-256 校验清单 |
 
 ## 上游项目
 
@@ -42,6 +41,18 @@ frp 与 Caddy 使用对应版本官方发行二进制。为缩小源码交付体
 - `app/static/transfer.py`：本机经 XTCP 直连上传并上报进度，使用脚本内 PEP 723 依赖声明。
 - `app/static/index.html`：无构建依赖的中文探针面板。
 - Relay Shell 补丁：清单变更后热更新，新注册服务器无需重启 MCP 服务即可使用。
+
+## 探针与 OAuth 扩展
+
+OAuth 复用 Relay Shell 的持久化提供者和 MCP SDK 2.3.0，增加 Fleet 所有者授权页；未引入独立认证服务。`app/probe.py` 使用标准库 SQLite 保存分钟聚合和真实 RTT 样本，前端仍为无构建依赖的单文件。
+
+GPU 采集采用可用的本机管理接口，不强制安装驱动或 Python 包。NVIDIA 使用 NVML / `nvidia-smi`，AMD 使用 `amd-smi` / `rocm-smi`。解析与测试数据参考：
+
+- [AMD SMI CLI 指标与单位实现](https://github.com/ROCm/amdsmi/blob/develop/amdsmi_cli/amdsmi_commands.py)：`usage.gfx_activity`，`mem_usage.used_vram/total_vram`；后者 JSON 标记 MB，实际使用 1024² 字节。
+- [AMD SMI Python 接口](https://github.com/ROCm/amdsmi/blob/develop/py-interface/amdsmi_interface.py)：设备名称和核心占用率字段。
+- [ROCm SMI CLI](https://github.com/ROCm/rocm_smi_lib/blob/master/python_smi_tools/rocm_smi.py)：`VRAM Total Memory (B)` 与 `VRAM Total Used Memory (B)` 直接以字节返回。
+
+GPU 测试使用依据这些接口构造的样本，当前部署的中枢无计算 GPU。
 
 ## 部署脚本的前置环境
 

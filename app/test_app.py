@@ -51,7 +51,7 @@ def test_admin_auth_and_state_shape(hub):
     assert client.get('/api/state', headers={'Authorization': 'Bearer wrong'}).status_code == 401
     response = client.get('/api/state', headers=ADMIN)
     assert response.status_code == 200
-    assert response.json() == {'nodes': [], 'transfers': [], 'mcp_url': 'https://hub.test/mcp', 'version': '1.0.0', 'update': {}}
+    assert response.json() == {'nodes': [], 'transfers': [], 'mcp_url': 'https://hub.test/mcp', 'version': '1.1.0', 'update': {}}
 
 
 @pytest.mark.parametrize('content', ['{incomplete', '[]', 'null'])

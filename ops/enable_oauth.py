@@ -19,10 +19,12 @@ def main():
     new = ('        forward_auth 127.0.0.1:8090 {\n'
            '            uri /internal/mcp-auth\n'
            '        }')
-    if new in original:
+    internal_old = '    @internal path /internal/*\n    respond @internal 404'
+    internal_new = '    handle /internal/* {\n        respond 404\n    }'
+    if new in original and internal_new in original:
         print('Fleet OAuth gateway is already enabled')
         return
-    if original.count(old) != 1:
+    if old not in original and new not in original:
         raise SystemExit('Existing Caddy authentication block differs; inspect before migration')
     verifier = 'http://127.0.0.1:8090/internal/mcp-auth'
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -39,7 +41,9 @@ def main():
         metadata = json.load(response)
         assert metadata['registration_endpoint'] and 'S256' in metadata['code_challenge_methods_supported']
     staged = caddyfile.with_name('Caddyfile.oauth-next')
-    updated = original.replace(old, new)
+    updated = original.replace(old, new).replace(internal_old, internal_new)
+    if internal_new not in updated:
+        raise SystemExit('Internal route guard differs; inspect before migration')
     staged.write_text(updated)
     staged.chmod(0o600)
     binary = '/opt/fleet/bin/caddy'

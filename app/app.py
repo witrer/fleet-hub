@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fleet_oauth import install_oauth
+from probe import ProbeStore
 
 ROOT = Path(os.environ.get('FLEET_ROOT', '/var/lib/fleet'))
 CODE = Path(__file__).parent
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS enrollments(token_hash TEXT PRIMARY KEY,name TEXT,exp
 CREATE TABLE IF NOT EXISTS transfers(id TEXT PRIMARY KEY,node_id TEXT,name TEXT,token_hash TEXT,expires REAL,status TEXT,bytes_total INTEGER,bytes_done INTEGER DEFAULT 0,speed_bps REAL DEFAULT 0,updated_at REAL,error TEXT DEFAULT '');
 ''')
 db.commit()
+probes = ProbeStore(db)
 proxy_status = {}
 
 def digest(token): return hashlib.sha256(token.encode()).hexdigest()
@@ -40,8 +42,13 @@ def refresh_inventory():
     atomic(ROOT/'.ssh'/'known_hosts', ''.join(f"[127.0.0.1]:{r['port']} {r['host_key']}\n" for r in rows))
     atomic(ROOT/'inventory.json', json.dumps(inv))
 def public_node(r):
+    now = time.time()
     metrics = json.loads(r['metrics'])
-    return dict(id=r['id'],name=r['name'],ssh_user=r['user'],last_seen=r['last_seen'],online=time.time()-r['last_seen']<35 and proxy_status.get(r['id']+'.ssh')=='online',**metrics)
+    metrics.pop('latency_samples', None)
+    node = dict(id=r['id'],name=r['name'],ssh_user=r['user'],last_seen=r['last_seen'],
+                online=now-r['last_seen']<35 and proxy_status.get(r['id']+'.ssh')=='online',
+                frp_status=proxy_status.get(r['id']+'.ssh'),**metrics)
+    return probes.enrich(node, now)
 
 def update_status():
     try:
@@ -62,6 +69,9 @@ async def monitor():
                 proxy_status.clear()
                 proxy_status.update({p['name']:p['status'] for p in response.json().get('proxies',[])})
             except Exception: proxy_status.clear()
+            probes.mark_offline([
+                {'id': r['id'], 'last_seen': r['last_seen'], 'frp_status': proxy_status.get(r['id']+'.ssh')}
+                for r in db.execute('SELECT id,last_seen FROM nodes WHERE active=1')])
             db.execute("UPDATE transfers SET status='failed',error='客户端心跳中断',speed_bps=0 WHERE status IN ('connecting','transferring') AND updated_at<?", (time.time()-90,))
             db.commit()
             await asyncio.sleep(5)
@@ -106,7 +116,31 @@ async def state(request:Request):
     nodes = [public_node(r) for r in db.execute('SELECT * FROM nodes WHERE active=1 ORDER BY name')]
     transfers = [dict(r) for r in db.execute('SELECT id,node_id,name,status,bytes_total,bytes_done,speed_bps,updated_at,error FROM transfers ORDER BY updated_at DESC LIMIT 50')]
     for t in transfers: t['mode']='p2p'
-    return dict(nodes=nodes,transfers=transfers,mcp_url=BASE+'/mcp',version='1.0.0',update=update_status())
+    return dict(nodes=nodes,transfers=transfers,mcp_url=BASE+'/mcp',version='1.1.0',update=update_status())
+
+def active_node(node_id):
+    if not db.execute('SELECT 1 FROM nodes WHERE id=? AND active=1', (node_id,)).fetchone():
+        raise HTTPException(404, 'Node not found')
+
+@app.get('/api/nodes/{node_id}/history')
+async def probe_history(node_id:str, request:Request, metric:str='cpu', range:str='1h', device:str|None=None):
+    admin(request); active_node(node_id)
+    try: return probes.history(node_id, metric, range, device)
+    except ValueError as exc: raise HTTPException(400, str(exc))
+
+@app.get('/api/latency/summary')
+async def probe_latency(request:Request, range:str='24h', bucket:str='15m', healthy_ms:float=100, critical_ms:float=250):
+    admin(request)
+    if range != '24h' or bucket != '15m': raise HTTPException(400, 'Supported window: 24h / 15m')
+    ids = [r[0] for r in db.execute('SELECT id FROM nodes WHERE active=1')]
+    try: return probes.latency_summary(ids, healthy_ms, critical_ms)
+    except ValueError as exc: raise HTTPException(400, str(exc))
+
+@app.put('/api/nodes/{node_id}/location')
+async def probe_location(node_id:str, request:Request):
+    admin(request); active_node(node_id)
+    try: return probes.set_location(node_id, await request.json())
+    except ValueError as exc: raise HTTPException(400, str(exc))
 
 @app.post('/api/enrollments')
 async def enrollment(request:Request):
@@ -179,8 +213,12 @@ allowUsers = ["*"]
 @app.post('/api/nodes/{node_id}/heartbeat')
 async def heartbeat(node_id:str,request:Request):
     node_auth(request,node_id); data=await request.json()
-    metrics={k:data[k] for k in ('cpu_percent','memory_percent','disk_percent','uptime','platform','load','network_rx','network_tx','agent_version') if k in data}
-    db.execute('UPDATE nodes SET last_seen=?,metrics=? WHERE id=?',(time.time(),json.dumps(metrics),node_id)); db.commit()
+    if not isinstance(data, dict): raise HTTPException(400, 'Expected an object')
+    now = time.time()
+    metrics = probes.clean_metrics(data)
+    latest = {k: v for k, v in metrics.items() if k != 'latency_samples'}
+    db.execute('UPDATE nodes SET last_seen=?,metrics=? WHERE id=?',(now,json.dumps(latest),node_id))
+    probes.record(node_id, metrics, now)
     return {'ok':True}
 
 @app.post('/api/nodes/{node_id}/revoke')
