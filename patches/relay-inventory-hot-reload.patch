@@ -1,0 +1,194 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3d074df..ec6a50b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Refresh SSH config and JSON inventory entries when file metadata changes, allowing
++  newly registered targets to be listed and resolved without restarting active sessions.
++
+ ## [0.4.0] - 2026-10-15
+ 
+ ### Fixed
+diff --git a/docs/architecture.md b/docs/architecture.md
+index af54eb3..918d4be 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -102,7 +102,7 @@ syscall and is default off, so the lifecycle above is otherwise unchanged.
+ | `errors` | Error types and the uniform `[ERROR: ...]` formatter. |
+ | `sessions` | Local PTY transport + transport-agnostic session registry. |
+ | `shelltools` | One-shot command/script execution (no PTY). |
+-| `inventory` | `~/.ssh/config` + JSON inventory parsing and resolution. |
++| `inventory` | `~/.ssh/config` + JSON inventory parsing and resolution, refreshed on source file metadata changes. |
+ | `sshpool` | asyncssh connection cache, exec, SFTP, forwarding, PTY adapter. |
+ | `auth/oauth` | Optional file-backed OAuth 2.1 provider (HTTP only). |
+ | `auth/resource` | Exact RFC 8707 resource binding and bounded validation of the OAuth token `resource` parameter (HTTP only). |
+diff --git a/docs/deployment.md b/docs/deployment.md
+index f5ec694..535297a 100644
+--- a/docs/deployment.md
++++ b/docs/deployment.md
+@@ -459,6 +459,13 @@ key. `RELAY_SHELL_SSH_KNOWN_HOSTS=strict` is recommended for production; pre-pop
+ `~/.ssh/known_hosts` for the service account. Provide a JSON inventory via
+ `RELAY_SHELL_INVENTORY` for hosts not in `ssh_config`.
+ 
++Inventory lookups refresh automatically when the JSON inventory or SSH config file's
++mtime, size, or inode changes. Write registrations to a temporary file and atomically
++replace the inventory so readers see complete JSON. No service restart is needed;
++existing SSH sessions continue on their established connections. Missing or malformed
++files retain the existing empty-file behavior. This changes metadata freshness only;
++the transport, command authority, and host-key policy are unchanged.
++
+ The SSH tools that take connection parameters (`ssh_exec`, `ssh_spawn`, `ssh_upload`,
+ `ssh_download`, `ssh_forward`) also accept a per-call `known_hosts` argument, so by default a
+ caller can pass `ignore` against a `strict` server default. Set
+diff --git a/src/relay_shell/inventory.py b/src/relay_shell/inventory.py
+index ee32e8e..ed3adc1 100644
+--- a/src/relay_shell/inventory.py
++++ b/src/relay_shell/inventory.py
+@@ -15,6 +15,18 @@ from pathlib import Path
+ 
+ __all__ = ["HostSpec", "Inventory"]
+ 
++_FileStamp = tuple[int, int, int] | None
++
++
++def _file_stamp(path: str) -> _FileStamp:
++    if not path:
++        return None
++    try:
++        stat = _expand(path).stat()
++    except OSError:
++        return None
++    return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
++
+ 
+ @dataclass(frozen=True)
+ class HostSpec:
+@@ -150,14 +162,26 @@ class Inventory:
+     # Raw ssh_config parse, kept so `ssh_config_aliases()` reports aliases the
+     # file declares even when an inventory entry overrides them.
+     _ssh_config_hosts: dict[str, HostSpec] = field(default_factory=dict)
++    _stamps: tuple[_FileStamp, _FileStamp] | None = field(default=None, repr=False)
++
++    def _source_stamps(self) -> tuple[_FileStamp, _FileStamp]:
++        return (_file_stamp(self.ssh_config), _file_stamp(self.inventory_path))
++
++    def _refresh(self) -> None:
++        if self._source_stamps() != self._stamps:
++            self.load()
+ 
+     def load(self) -> Inventory:
++        # Capture before reading: a concurrent atomic replacement is then noticed
++        # on the next lookup even when it happened during this load.
++        stamps = self._source_stamps()
+         ssh_config_hosts = _parse_ssh_config(_expand(self.ssh_config))
+         merged = dict(ssh_config_hosts)
+         if self.inventory_path:
+             merged.update(_load_inventory_file(_expand(self.inventory_path)))
+         self._hosts = merged
+         self._ssh_config_hosts = ssh_config_hosts
++        self._stamps = stamps
+         return self
+ 
+     @property
+@@ -179,10 +203,12 @@ class Inventory:
+         reports aliases overridden by an inventory entry, so it reflects what
+         the file declares.
+         """
++        self._refresh()
+         return sorted(self._ssh_config_hosts.keys())
+ 
+     def resolve(self, alias: str) -> HostSpec:
+         """Return a known spec or a passthrough spec (asyncssh resolves it)."""
++        self._refresh()
+         if alias in self._hosts:
+             return self._hosts[alias]
+         if "@" in alias:
+@@ -192,7 +218,9 @@ class Inventory:
+ 
+     def knows(self, target: str) -> bool:
+         """True if ``target`` is an inventory alias or the hostname of an entry."""
++        self._refresh()
+         return target in self._hosts or any(h.hostname == target for h in self._hosts.values())
+ 
+     def hosts(self) -> list[HostSpec]:
++        self._refresh()
+         return sorted(self._hosts.values(), key=lambda h: h.name)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index ec0bbf8..172c9fa 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ from pathlib import Path
++from unittest.mock import patch
+ 
+ from relay_shell.inventory import Inventory
+ 
+@@ -83,3 +85,59 @@ def test_non_ascii_digit_port_is_ignored_not_a_crash(tmp_path: Path) -> None:
+     cfg.write_text("Host odd\n    HostName 10.0.0.9\n    Port ²\n", encoding="utf-8")
+     hosts = {h.name: h for h in Inventory(str(cfg), "").load().hosts()}
+     assert hosts["odd"].port is None
++
++
++def test_inventory_register_update_remove_without_restart(tmp_path: Path) -> None:
++    invf = tmp_path / "inv.json"
++    inv = Inventory(str(tmp_path / "config"), str(invf)).load()
++    assert inv.hosts() == []
++
++    invf.write_text(json.dumps({"train": {"hostname": "127.0.0.1", "port": 23001}}))
++    assert inv.knows("train")
++    assert inv.resolve("train").port == 23001
++    assert [h.name for h in inv.hosts()] == ["train"]
++
++    # Registry writers replace JSON atomically. Even preserving size and mtime,
++    # replacing its inode must invalidate the cached endpoint.
++    stamp = invf.stat()
++    replacement = tmp_path / "next.json"
++    replacement.write_text(json.dumps({"train": {"hostname": "127.0.0.1", "port": 23002}}))
++    os.utime(replacement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
++    replacement.replace(invf)
++    assert inv.resolve("train").port == 23002
++
++    invf.unlink()
++    assert not inv.knows("train")
++    assert inv.hosts() == []
++
++
++def test_ssh_config_refresh_preserves_inventory_override(tmp_path: Path) -> None:
++    cfg = tmp_path / "config"
++    cfg.write_text("Host train\n  HostName 10.0.0.1\n")
++    invf = tmp_path / "inv.json"
++    invf.write_text(json.dumps({"train": {"hostname": "127.0.0.1", "port": 23001}}))
++    inv = Inventory(str(cfg), str(invf)).load()
++    cfg.write_text("Host train\n  HostName 10.0.0.2\nHost extra\n  HostName 10.0.0.3\n")
++    assert inv.ssh_config_aliases() == ["extra", "train"]
++    assert inv.resolve("train").hostname == "127.0.0.1"
++    assert inv.resolve("extra").hostname == "10.0.0.3"
++
++
++def test_unchanged_inventory_does_not_read_contents(tmp_path: Path) -> None:
++    invf = tmp_path / "inv.json"
++    invf.write_text(json.dumps({"train": {"hostname": "127.0.0.1"}}))
++    inv = Inventory(str(tmp_path / "config"), str(invf)).load()
++    with patch.object(Path, "read_text", side_effect=AssertionError("unexpected re-read")):
++        assert inv.resolve("train").hostname == "127.0.0.1"
++        assert inv.knows("train")
++        assert len(inv.hosts()) == 1
++        assert inv.ssh_config_aliases() == []
++
++
++def test_invalid_inventory_then_repaired_refreshes(tmp_path: Path) -> None:
++    invf = tmp_path / "inv.json"
++    invf.write_text("invalid")
++    inv = Inventory(str(tmp_path / "config"), str(invf)).load()
++    assert inv.hosts() == []
++    invf.write_text(json.dumps({"train": {"hostname": "127.0.0.1"}}))
++    assert inv.knows("train")

@@ -1,0 +1,125 @@
+# Fleet Hub
+
+**一条命令接入训练服务器，通过带鉴权的远程 MCP 执行 SSH，探针面板显示节点和数据传输状态。**
+
+日常命令经公网中枢的反向隧道执行；大文件使用 frp XTCP 从本机直连目标服务器。公开仓库的 `main` 分支为中枢发布分支，服务器每 10 分钟检查一次新提交。
+
+## 使用
+
+### 接入服务器
+
+在 WebUI 输入中枢 Bearer Token，点击 **接入服务器** 并填写名称，将生成的命令粘贴到目标服务器终端：
+
+```bash
+curl -fsSL https://YOUR_HUB/install.sh | bash -s -- '<一次性注册令牌>'
+```
+
+注册命令单次有效、30 分钟过期。目标节点支持 Linux amd64 / arm64，需要 `curl`、Python 3 和 SSH 服务。以希望 Agent 使用的用户执行；注册程序会安装隧道与探针、写入中枢 SSH 公钥，并自动更新 MCP 清单。
+
+root + systemd 环境会建立 `fleet-node.service` 并开机启动；其他环境使用后台进程。SSH 非默认端口时，执行命令前设置 `FLEET_SSH_PORT`。
+
+### 连接 Agent
+
+| 配置 | 内容 |
+| --- | --- |
+| 传输 | Streamable HTTP |
+| URL | `https://YOUR_HUB/mcp` |
+| 鉴权头 | `Authorization: Bearer <中枢访问令牌>` |
+
+常用工具：
+
+- `fleet_status`、`fleet_enroll`、`fleet_revoke`：节点列表、注册、撤销。
+- `ssh_hosts`、`ssh_check`、`ssh_exec`、`ssh_fanout`：清单、连通检查、单台及批量命令。
+- `ssh_spawn`、`session_send`、`session_recv`、`session_list`、`session_kill`：交互式 SSH。
+- `ssh_upload`、`ssh_download`：中枢与目标之间的 SFTP。
+
+`host` 使用节点 ID。MCP 命令策略为 `open`，未开启逐条命令审批。SFTP 的 `local_path` 指中枢服务器上的路径；电脑上的数据集使用本地传输客户端。
+
+### 上传数据集
+
+下载中枢提供的 `/transfer.py`，在本机设置环境变量 `FLEET_TOKEN`，运行：
+
+```bash
+uv run transfer.py --hub https://YOUR_HUB --node node-xxxxxxxxxx \
+  --source ./dataset --destination /data/dataset
+```
+
+客户端通过 PEP 723 声明自动准备依赖，使用独立临时 SSH 密钥建立 XTCP 直连。面板显示字节数、进度、平均速度和失败原因。文件内容不通过中枢转发。
+
+直连打洞重试窗口约 60 秒，SSH 握手及认证各最多等待 15 秒；失败即停止，不回退到中枢中继。当前支持文件与目录上传，不支持断点续传或符号链接。覆盖同名文件需显式添加 `--overwrite`。
+
+### 节点在线状态
+
+探针每 10 秒上报；最近心跳不足 35 秒且 frp SSH 代理为 `online` 时，节点显示在线。WebUI 每 5 秒刷新。传输任务超过 90 秒未更新进度，会标记为失败。
+
+## 仓库与自动发布
+
+公开仓库为 [witrer/fleet-hub](https://github.com/witrer/fleet-hub)，默认发布分支 `main`。中枢通过公共 HTTPS 地址拉取代码，无需 GitHub Token 或 Deploy Key。
+
+后续更新流程：
+
+```bash
+git add app wheels
+git commit -m "Describe the change"
+git push origin main
+```
+
+中枢每 10 分钟检查 `main`，有新提交时发布 `app/` 和 `wheels/`。自动更新范围为中枢应用与 Relay Shell wheel；操作系统、frp、Caddy 和基础 Python 环境由单独的运维操作管理。目标服务器已经安装的探针不在此次自动发布范围内；新注册节点和重新下载的传输客户端使用中枢提供的新版本。
+
+WebUI 的 **中枢更新** 区域显示当前提交短 SHA、最近检查时间、部署结果及失败说明。更新器记录在 `/var/lib/fleet/update-status.json`，仅经过管理员鉴权的 `/api/state` 会返回这些信息。状态文件缺失或暂时不可读时，不影响节点、SSH 和探针接口。
+
+### 检查与控制更新
+
+以下命令在中枢 root SSH 终端执行：
+
+```bash
+# 查看每 10 分钟运行的更新定时器
+systemctl status fleet-update.timer --no-pager
+systemctl list-timers fleet-update.timer --no-pager
+
+# 立即检查一次
+systemctl start fleet-update.service
+
+# 查看检查、部署与回滚结果
+journalctl -u fleet-update -n 50 --no-pager
+
+# 暂停后续自动检查
+systemctl stop fleet-update.timer
+
+# 恢复并启用开机检查
+systemctl enable --now fleet-update.timer
+```
+
+已有服务的接管沿用 `/var/lib/fleet` 内的数据库、令牌、节点密钥和证书状态。代码仓库位于 `/opt/fleet/repo`，远端地址为 `https://github.com/witrer/fleet-hub.git`；更新器独立配置位于 `/etc/fleet-updater.json`。这些运行文件不进入 Git。
+
+## 布局
+
+| 路径 | 用途 |
+| --- | --- |
+| `app/app.py` | 注册、探针、传输状态和 frp 鉴权 API |
+| `app/mcp_entry.py` | Relay Shell 与 Fleet 节点工具 |
+| `app/static/index.html` | 无构建依赖的中文 WebUI |
+| `app/static/node.py` | Linux 节点安装及探针 |
+| `app/static/transfer.py` | 本地 XTCP 传输客户端 |
+| `app/assets.json` | frp 下载文件名与 SHA-256 |
+| `deploy_fleet.py` | 初始服务和系统配置生成 |
+| `patches/`、`wheels/` | Relay Shell 清单热更新补丁与构建产物 |
+| `licenses/`、`SOURCES.md` | 上游许可证、版本与来源 |
+
+frp 下载包不提交 Git；生产环境保留 `/opt/fleet/app/downloads`。仓库中的空目录用于开发和测试。
+
+## 本地验证
+
+Python 3.12 或更新的兼容环境中，安装项目 wheel、FastAPI、HTTPX 和 pytest 后运行：
+
+```bash
+python -m pytest app/test_app.py -q
+```
+
+中枢健康检查为 `/health`；实际节点状态、SSH 可用性和更新结果通过鉴权 MCP 或 WebUI 查看。
+
+## HTTPS 与来源
+
+当前部署使用可信 IP HTTPS 证书。Caddy 使用 HTTP-01 与 `shortlived` 配置自动管理证书；TCP 80 用于验证和 HTTPS 跳转，TCP 443 提供 WebUI 与 MCP。短期证书续期需要保留验证入口和 Caddy 状态目录。
+
+上游：frp `0.71.1`、Relay Shell `0.4.0`（`a4e4835fb81f22d18208c468423ddf0d954ceb62`）、Caddy `2.11.7`。各自许可证与修改来源见 [SOURCES.md](SOURCES.md) 和 [licenses/](licenses/)。
