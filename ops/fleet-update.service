@@ -1,0 +1,14 @@
+[Unit]
+Description=Check and deploy Fleet application updates
+After=network-online.target fleet-hub.service fleet-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/fleet/venv/bin/python /opt/fleet/ops/fleet_update.py --config /etc/fleet-updater.json
+TimeoutStartSec=600
+TimeoutStopSec=120
+KillMode=mixed
+UMask=0022
+

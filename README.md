@@ -54,9 +54,9 @@ uv run transfer.py --hub https://YOUR_HUB --node node-xxxxxxxxxx \
 
 ## 仓库与自动发布
 
-公开仓库为 [witrer/fleet-hub](https://github.com/witrer/fleet-hub)，默认发布分支 `main`。中枢通过公共 HTTPS 地址拉取代码，无需 GitHub Token 或 Deploy Key。
+公开仓库为 [witrer/fleet-hub](https://github.com/witrer/fleet-hub)，默认发布分支 `main`。中枢通过 GitHub 加速镜像 `https://gh-proxy.org/https://github.com/witrer/fleet-hub.git` 拉取，无需 Token 或 Deploy Key。镜像 URL 格式见 [GH-Proxy 官方使用指南](https://gh-proxy.com/docs/github-accelerator/)。
 
-后续更新流程：
+后续在开发机向官方 GitHub 远端提交改动，中枢再通过镜像获取。以下开发机命令中的 `origin` 指官方仓库：
 
 ```bash
 git add app wheels
@@ -67,6 +67,34 @@ git push origin main
 中枢每 10 分钟检查 `main`，有新提交时发布 `app/` 和 `wheels/`。自动更新范围为中枢应用与 Relay Shell wheel；操作系统、frp、Caddy 和基础 Python 环境由单独的运维操作管理。目标服务器已经安装的探针不在此次自动发布范围内；新注册节点和重新下载的传输客户端使用中枢提供的新版本。
 
 WebUI 的 **中枢更新** 区域显示当前提交短 SHA、最近检查时间、部署结果及失败说明。更新器记录在 `/var/lib/fleet/update-status.json`，仅经过管理员鉴权的 `/api/state` 会返回这些信息。状态文件缺失或暂时不可读时，不影响节点、SSH 和探针接口。
+
+### 一次性接管已有中枢
+
+接管脚本用于已经运行 Fleet 的服务器，要求保留现有 `/opt/fleet/app`、`/opt/fleet/venv` 和 `/var/lib/fleet`。
+
+通过加速镜像将仓库检出到 `/opt/fleet/repo`：
+
+```bash
+git clone --branch main --single-branch \
+  https://gh-proxy.org/https://github.com/witrer/fleet-hub.git /opt/fleet/repo
+```
+
+将 `ops/updater-config.example.json` 保存为 `/etc/fleet-updater.json`，保留示例中的路径及 `branch: main`。更新器直接使用仓库的 `origin` 拉取，无需配置拉取凭据。
+
+已存在代码仓库时，使用以下命令将拉取地址切换到同一镜像：
+
+```bash
+git -C /opt/fleet/repo remote set-url origin \
+  https://gh-proxy.org/https://github.com/witrer/fleet-hub.git
+```
+
+然后以 root 执行：
+
+```bash
+/opt/fleet/venv/bin/python /opt/fleet/repo/ops/install_updater.py
+```
+
+脚本会保存现有应用为初始回滚版本，将下载包移入共享目录，安装更新器及 systemd 配置，并检查原有中枢和 MCP 服务。首次 Git 更新成功后，才启用 10 分钟定时器。运行数据库、令牌、节点密钥和证书状态继续沿用。
 
 ### 检查与控制更新
 
@@ -83,6 +111,9 @@ systemctl start fleet-update.service
 # 查看检查、部署与回滚结果
 journalctl -u fleet-update -n 50 --no-pager
 
+# 修复环境后，显式重试上次失败的提交
+/opt/fleet/venv/bin/python /opt/fleet/ops/fleet_update.py --retry
+
 # 暂停后续自动检查
 systemctl stop fleet-update.timer
 
@@ -90,7 +121,7 @@ systemctl stop fleet-update.timer
 systemctl enable --now fleet-update.timer
 ```
 
-已有服务的接管沿用 `/var/lib/fleet` 内的数据库、令牌、节点密钥和证书状态。代码仓库位于 `/opt/fleet/repo`，远端地址为 `https://github.com/witrer/fleet-hub.git`；更新器独立配置位于 `/etc/fleet-updater.json`。这些运行文件不进入 Git。
+已有服务的接管沿用 `/var/lib/fleet` 内的数据库、令牌、节点密钥和证书状态。代码仓库位于 `/opt/fleet/repo`，更新器独立配置位于 `/etc/fleet-updater.json`。镜像入口由该仓库的 `origin` 配置，修改后会在下一次更新检查时使用；不改动系统全局 Git 配置。运行数据不进入 Git。
 
 ## 布局
 
@@ -103,6 +134,8 @@ systemctl enable --now fleet-update.timer
 | `app/static/transfer.py` | 本地 XTCP 传输客户端 |
 | `app/assets.json` | frp 下载文件名与 SHA-256 |
 | `deploy_fleet.py` | 初始服务和系统配置生成 |
+| `ops/install_updater.py` | 接管现有中枢并启用自动发布 |
+| `ops/fleet_update.py` | 拉取、健康检查、发布与失败回滚 |
 | `patches/`、`wheels/` | Relay Shell 清单热更新补丁与构建产物 |
 | `licenses/`、`SOURCES.md` | 上游许可证、版本与来源 |
 

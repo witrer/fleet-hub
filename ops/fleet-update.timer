@@ -1,0 +1,13 @@
+[Unit]
+Description=Check the Fleet Git repository every ten minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=10min
+AccuracySec=10s
+Persistent=true
+Unit=fleet-update.service
+
+[Install]
+WantedBy=timers.target
+

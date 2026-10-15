@@ -1,0 +1,11 @@
+{
+  "repo_path": "/opt/fleet/repo",
+  "branch": "main",
+  "base_dir": "/opt/fleet",
+  "data_dir": "/var/lib/fleet",
+  "python": "/opt/fleet/venv/bin/python",
+  "lock_path": "/var/lib/fleet-updater/update.lock",
+  "health_url": "http://127.0.0.1:8090/health",
+  "mcp_url": "http://127.0.0.1:8080/mcp",
+  "health_timeout": 30
+}
