@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
+import json
+import logging
 import secrets
 import time
 from pathlib import Path
@@ -131,6 +133,16 @@ def install_oauth(app, cfg, root):
                'X-Frame-Options': 'DENY',
                'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"}
 
+    @app.middleware('http')
+    async def discovery_diagnostics(request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith('/.well-known/') or request.url.path == '/register':
+            # Record discovery compatibility failures without query strings, credentials or bodies.
+            logging.getLogger('uvicorn.error').info('oauth-discovery %s', json.dumps({
+                'method': request.method, 'path': request.url.path, 'status': response.status_code,
+                'user_agent': request.headers.get('user-agent', '')[:160]}))
+        return response
+
     def reject(message, status=400):
         return JSONResponse({'error': message}, status_code=status, headers=headers)
 
@@ -226,15 +238,21 @@ label{display:block;margin:24px 0 8px}input{box-sizing:border-box;width:100%;pad
     metadata.token_endpoint_auth_methods_supported = ['none', 'client_secret_post']
     metadata.revocation_endpoint_auth_methods_supported = ['none', 'client_secret_post']
     routes = [route for route in routes if route.path != '/.well-known/oauth-authorization-server']
-    routes.append(Route('/.well-known/oauth-authorization-server',
-                        endpoint=cors_middleware(MetadataHandler(metadata).handle, ['GET', 'OPTIONS']),
-                        methods=['GET', 'OPTIONS']))
+    for path in ('/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/mcp'):
+        routes.append(Route(path,
+                            endpoint=cors_middleware(MetadataHandler(metadata).handle, ['GET', 'OPTIONS']),
+                            methods=['GET', 'OPTIONS']))
     for route in routes:
         if route.path == '/revoke':
             route.app = PublicClientRevocationCompatibility(route.app)
     app.router.routes.extend(routes)
-    app.router.routes.extend(create_protected_resource_routes(
-        auth.resource_server_url, [auth.issuer_url], scopes_supported=SCOPES, resource_name='Fleet SSH'))
+    resource_routes = create_protected_resource_routes(
+        auth.resource_server_url, [auth.issuer_url], scopes_supported=SCOPES, resource_name='Fleet SSH')
+    app.router.routes.extend(resource_routes)
+    # Some connection forms probe the origin before reading the MCP 401 challenge.
+    canonical = next(route for route in resource_routes if route.path == '/.well-known/oauth-protected-resource/mcp')
+    app.router.routes.append(Route('/.well-known/oauth-protected-resource',
+                                   endpoint=canonical.endpoint, methods=['GET', 'OPTIONS']))
     # The SDK parses token resource fields but does not pass them to the provider.
     app.add_middleware(TokenResourceMiddleware, resource_url=base + '/mcp')
     return provider

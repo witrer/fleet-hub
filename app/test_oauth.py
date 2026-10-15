@@ -147,6 +147,11 @@ def test_discovery_dcr_and_original_admin_bearer(oauth):
     assert 'none' in as_meta['token_endpoint_auth_methods_supported']
     assert 'refresh_token' in as_meta['grant_types_supported']
     assert OWNER not in metadata.text + resource.text
+    for alias, expected in [('/.well-known/oauth-protected-resource', rs_meta),
+                            ('/.well-known/oauth-authorization-server/mcp', as_meta)]:
+        result = oauth.get(alias)
+        assert result.status_code == 200 and result.json() == expected
+        assert oauth.head(alias).status_code == 200
     registration = register(oauth)
     assert registration['token_endpoint_auth_method'] == 'none'
     assert not registration.get('client_secret')
