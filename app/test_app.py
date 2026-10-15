@@ -149,6 +149,127 @@ def test_transfer_expiry_uses_target_local_time_for_openssh_89(hub, monkeypatch)
     assert '20261016124500Z' not in commands[1]
 
 
+@pytest.mark.parametrize('stage', ['ssh_connect', 'target_clock', 'authorize_key'])
+def test_transfer_preparation_has_total_deadline_and_reports_stage(hub, monkeypatch, stage):
+    import asyncio
+    from types import SimpleNamespace
+    module, client, _ = hub
+    payload = body()
+    node = client.post('/api/enroll', headers=grant(client), json=payload).json()
+
+    async def wait():
+        await asyncio.Event().wait()
+
+    class Connection:
+        async def __aenter__(self):
+            if stage == 'ssh_connect': await wait()
+            return self
+        async def __aexit__(self, *args): pass
+        async def run(self, command, **kwargs):
+            if (command.startswith('date ') and stage == 'target_clock' or
+                    not command.startswith('date ') and stage == 'authorize_key'):
+                await wait()
+            return SimpleNamespace(stdout='20261016124500\n')
+
+    monkeypatch.setattr(module, 'TRANSFER_PREPARE_TIMEOUT', .01)
+    monkeypatch.setattr(module.asyncssh, 'connect', lambda *args, **kwargs: Connection())
+    response = client.post('/api/transfers', headers=ADMIN, json={
+        'node_id': node['id'], 'public_key': payload['ssh_host_key'], 'bytes_total': 31,
+    })
+    assert response.status_code == 504
+    assert stage in response.json()['detail']
+    assert module.db.execute('SELECT count(*) FROM transfers').fetchone()[0] == 0
+
+
+def test_transfer_progress_keeps_phase_timing_and_accepts_legacy_clients(hub, monkeypatch):
+    from types import SimpleNamespace
+    module, client, _ = hub
+    payload = body()
+    node = client.post('/api/enroll', headers=grant(client), json=payload).json()
+
+    class Connection:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def run(self, *args, **kwargs):
+            return SimpleNamespace(stdout='20261016124500\n')
+
+    monkeypatch.setattr(module.asyncssh, 'connect', lambda *args, **kwargs: Connection())
+    job = client.post('/api/transfers', headers=ADMIN, json={
+        'node_id': node['id'], 'public_key': payload['ssh_host_key'], 'bytes_total': 100,
+    }).json()
+    url = '/api/transfers/' + job['id'] + '/progress'
+    auth = {'Authorization': 'Bearer ' + job['token']}
+    progress = {'status': 'transferring', 'phase': 'transferring', 'bytes_done': 50,
+                'speed_bps': 10, 'elapsed_seconds': 185, 'transfer_seconds': 5}
+    assert client.post(url, headers=auth, json=progress).status_code == 200
+    stored = client.get('/api/state', headers=ADMIN).json()['transfers'][0]
+    assert all(stored[key] == value for key, value in progress.items())
+    for bad in ({'phase': 'unknown'}, {'phase': []}, {'elapsed_seconds': -1},
+                {'transfer_seconds': True}, {'elapsed_seconds': '185'}):
+        assert client.post(url, headers=auth, json={**progress, **bad}).status_code == 400
+    # Old uploaders omit phase/timers; retained history must not be erased.
+    assert client.post(url, headers=auth, json={'status': 'completed', 'bytes_done': 100}).status_code == 200
+    stored = client.get('/api/state', headers=ADMIN).json()['transfers'][0]
+    assert stored['phase'] == 'completed'
+    assert stored['elapsed_seconds'] == 185 and stored['transfer_seconds'] == 5
+
+
+def test_transfer_schema_upgrade_preserves_existing_history(hub):
+    import sqlite3
+    module, _, _ = hub
+    with sqlite3.connect(':memory:') as legacy:
+        legacy.execute('CREATE TABLE transfers(id TEXT, status TEXT)')
+        legacy.execute("INSERT INTO transfers VALUES('old-job', 'completed')")
+        module.ensure_transfer_fields(legacy)
+        module.ensure_transfer_fields(legacy)
+        assert legacy.execute('SELECT * FROM transfers').fetchone() == ('old-job', 'completed', None, None, None)
+
+
+def test_fresh_heartbeat_with_unknown_tunnel_is_not_confirmed_offline(hub):
+    module, client, _ = hub
+    node = client.post('/api/enroll', headers=grant(client), json=body()).json()
+    client.post('/api/nodes/' + node['id'] + '/heartbeat',
+                headers={'Authorization': 'Bearer ' + node['token']}, json={})
+    public = client.get('/api/state', headers=ADMIN).json()['nodes'][0]
+    assert public['connection_status'] == 'unknown' and public['online'] is False
+    module.proxy_status[node['id'] + '.ssh'] = 'offline'
+    assert client.get('/api/state', headers=ADMIN).json()['nodes'][0]['connection_status'] == 'offline'
+    module.proxy_status[node['id'] + '.ssh'] = 'online'
+    assert client.get('/api/state', headers=ADMIN).json()['nodes'][0]['connection_status'] == 'online'
+    module.proxy_status.clear()
+    module.db.execute('UPDATE nodes SET last_seen=0 WHERE id=?', (node['id'],))
+    assert client.get('/api/state', headers=ADMIN).json()['nodes'][0]['connection_status'] == 'offline'
+
+
+def test_monitor_failure_keeps_node_unknown_and_transfer_phase_failed(hub, monkeypatch):
+    import asyncio
+    module, client, _ = hub
+    node = client.post('/api/enroll', headers=grant(client), json=body()).json()
+    client.post('/api/nodes/' + node['id'] + '/heartbeat',
+                headers={'Authorization': 'Bearer ' + node['token']}, json={})
+    module.proxy_status[node['id'] + '.ssh'] = 'online'
+    module.db.execute('INSERT INTO transfers(id,node_id,status,phase,updated_at) VALUES(?,?,?,?,?)',
+                      ('stale-job', node['id'], 'transferring', 'transferring', module.time.time()-100))
+    module.db.commit()
+
+    class DashboardUnavailable:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, *args, **kwargs): raise TimeoutError('synthetic dashboard timeout')
+
+    class EndIteration(Exception): pass
+    async def stop(_): raise EndIteration
+
+    with monkeypatch.context() as context:
+        context.setattr(module.httpx, 'AsyncClient', lambda **kwargs: DashboardUnavailable())
+        context.setattr(module.asyncio, 'sleep', stop)
+        with pytest.raises(EndIteration):
+            asyncio.run(module.monitor())
+    state = client.get('/api/state', headers=ADMIN).json()
+    assert state['nodes'][0]['connection_status'] == 'unknown'
+    assert state['transfers'][0]['status'] == state['transfers'][0]['phase'] == 'failed'
+
+
 def test_agent_release_matches_the_downloaded_script(hub):
     import hashlib
     _, client, _ = hub

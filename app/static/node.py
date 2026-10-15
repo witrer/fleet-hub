@@ -585,14 +585,15 @@ def metrics(previous):
                      'network_rx': sum(int(n[0]) for n in net), 'network_tx': sum(int(n[8]) for n in net)}
 
 
-def check_update(root, cfg):
+def prepare_update(root, cfg):
+    """Fetch and validate a release without changing the running agent on disk."""
     release = request(cfg['hub'], '/api/agent-release', cfg['token'])
     expected = release['sha256']
     if not isinstance(expected, str) or not re.fullmatch('[0-9a-f]{64}', expected):
         raise ValueError('Invalid agent release checksum')
     current = root / 'node.py'
     if hashlib.sha256(current.read_bytes()).hexdigest() == expected:
-        return False
+        return None
     url = urllib.parse.urljoin(cfg['hub'] + '/', release['url'])
     if urllib.parse.urlparse(url).netloc != urllib.parse.urlparse(cfg['hub']).netloc:
         raise ValueError('Agent download must use the enrolled hub')
@@ -601,10 +602,62 @@ def check_update(root, cfg):
     if hashlib.sha256(source).hexdigest() != expected:
         raise ValueError('Agent update checksum mismatch')
     compile(source, str(current), 'exec')
-    atomic(current, source)
-    atomic(root / 'agent-version.json', json.dumps({'version': release.get('version', expected[:12]), 'updated_at': time.time()}))
+    return {'source': source, 'version': release.get('version', expected[:12])}
+
+
+def apply_update(root, release):
+    # Only the main loop commits an update, after the worker has finished.
+    atomic(root / 'node.py', release['source'])
+    try:
+        atomic(root / 'agent-version.json', json.dumps({'version': release['version'], 'updated_at': time.time()}))
+    except OSError as exc:
+        # The new source is already installed: restart even if this optional marker cannot be saved.
+        print('agent version marker: ' + str(exc), flush=True)
     print('节点已更新，正在自动重连…', flush=True)
     return True
+
+
+def check_update(root, cfg):
+    release = prepare_update(root, cfg)
+    return apply_update(root, release) if release is not None else False
+
+
+class AgentUpdater:
+    """Keep release HTTP requests off the heartbeat and FRP supervision path."""
+
+    def __init__(self, root, cfg):
+        self.root, self.cfg = root, cfg
+        self.next_check = time.monotonic() + UPDATE_INTERVAL
+        self.worker = None
+        self.pending = None
+        self.error = None
+
+    def _prepare(self):
+        try:
+            self.pending = prepare_update(self.root, self.cfg)
+        except Exception as exc:
+            self.error = exc
+
+    def poll(self):
+        if self.worker is not None:
+            if self.worker.is_alive():
+                return False
+            self.worker = None
+            self.next_check = time.monotonic() + UPDATE_INTERVAL
+            release, error = self.pending, self.error
+            self.pending = self.error = None
+            if error is not None:
+                print('agent update: ' + str(error), flush=True)
+            elif release is not None:
+                try:
+                    return apply_update(self.root, release)
+                except Exception as exc:
+                    print('agent update: ' + str(exc), flush=True)
+            return False
+        if time.monotonic() >= self.next_check:
+            self.worker = threading.Thread(target=self._prepare, daemon=True)
+            self.worker.start()
+        return False
 
 
 def terminate(child):
@@ -634,8 +687,8 @@ def run(args):
         atomic(root / 'run.pid', str(os.getpid()))
         cfg = json.loads((root / 'config.json').read_text())
         version = hashlib.sha256((root / 'node.py').read_bytes()).hexdigest()[:12]
-        previous, child, next_update = cpu(), None, time.monotonic() + UPDATE_INTERVAL
-        gpu, latency = GPUCollector(), HeartbeatLatency()
+        previous, child = cpu(), None
+        gpu, latency, updater = GPUCollector(), HeartbeatLatency(), AgentUpdater(root, cfg)
         def stop(*_):
             raise SystemExit(0)
         signal.signal(signal.SIGTERM, stop)
@@ -652,13 +705,8 @@ def run(args):
                     latency.send(cfg, payload)
                 except Exception as exc:
                     print('heartbeat: ' + str(exc), flush=True)
-                if time.monotonic() >= next_update:
-                    next_update = time.monotonic() + UPDATE_INTERVAL
-                    try:
-                        if check_update(root, cfg):
-                            return
-                    except Exception as exc:
-                        print('agent update: ' + str(exc), flush=True)
+                if updater.poll():
+                    return
                 time.sleep(10)
         finally:
             terminate(child)

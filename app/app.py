@@ -1,4 +1,4 @@
-import asyncio, contextlib, hashlib, hmac, json, os, re, secrets, shlex, sqlite3, time
+import asyncio, contextlib, hashlib, hmac, json, math, os, re, secrets, shlex, sqlite3, time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import asyncssh, httpx
@@ -13,6 +13,16 @@ CODE = Path(__file__).parent
 CFG = json.loads((ROOT / 'config.json').read_text())
 BASE = CFG['base_url']
 FRP_VERSION = '0.71.1'
+TRANSFER_PREPARE_TIMEOUT = 40
+TRANSFER_PHASES = {'preparing_tool', 'connecting', 'transferring', 'completed', 'failed'}
+
+def ensure_transfer_fields(connection):
+    # Additive migration: old clients and existing transfer history stay valid.
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(transfers)')}
+    for name, kind in (('phase', 'TEXT'), ('elapsed_seconds', 'REAL'), ('transfer_seconds', 'REAL')):
+        if name not in columns:
+            connection.execute(f'ALTER TABLE transfers ADD COLUMN {name} {kind}')
+
 db = sqlite3.connect(ROOT / 'fleet.db', check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript('''
@@ -21,6 +31,7 @@ CREATE TABLE IF NOT EXISTS nodes(id TEXT PRIMARY KEY,name TEXT,user TEXT,port IN
 CREATE TABLE IF NOT EXISTS enrollments(token_hash TEXT PRIMARY KEY,name TEXT,expires REAL);
 CREATE TABLE IF NOT EXISTS transfers(id TEXT PRIMARY KEY,node_id TEXT,name TEXT,token_hash TEXT,expires REAL,status TEXT,bytes_total INTEGER,bytes_done INTEGER DEFAULT 0,speed_bps REAL DEFAULT 0,updated_at REAL,error TEXT DEFAULT '');
 ''')
+ensure_transfer_fields(db)
 db.commit()
 probes = ProbeStore(db)
 proxy_status = {}
@@ -45,9 +56,12 @@ def public_node(r):
     now = time.time()
     metrics = json.loads(r['metrics'])
     metrics.pop('latency_samples', None)
+    frp_status = proxy_status.get(r['id']+'.ssh')
+    connection_status = ('offline' if now-r['last_seen'] >= 35 or frp_status == 'offline' else
+                         'online' if frp_status == 'online' else 'unknown')
     node = dict(id=r['id'],name=r['name'],ssh_user=r['user'],last_seen=r['last_seen'],
-                online=now-r['last_seen']<35 and proxy_status.get(r['id']+'.ssh')=='online',
-                frp_status=proxy_status.get(r['id']+'.ssh'),**metrics)
+                online=connection_status=='online', connection_status=connection_status,
+                frp_status=frp_status,**metrics)
     return probes.enrich(node, now)
 
 def update_status():
@@ -72,7 +86,7 @@ async def monitor():
             probes.mark_offline([
                 {'id': r['id'], 'last_seen': r['last_seen'], 'frp_status': proxy_status.get(r['id']+'.ssh')}
                 for r in db.execute('SELECT id,last_seen FROM nodes WHERE active=1')])
-            db.execute("UPDATE transfers SET status='failed',error='客户端心跳中断',speed_bps=0 WHERE status IN ('connecting','transferring') AND updated_at<?", (time.time()-90,))
+            db.execute("UPDATE transfers SET status='failed',phase='failed',error='客户端心跳中断',speed_bps=0 WHERE status IN ('connecting','transferring') AND updated_at<?", (time.time()-90,))
             db.commit()
             await asyncio.sleep(5)
 
@@ -114,7 +128,7 @@ app.mount('/downloads',StaticFiles(directory=CODE/'downloads'),name='downloads')
 async def state(request:Request):
     admin(request)
     nodes = [public_node(r) for r in db.execute('SELECT * FROM nodes WHERE active=1 ORDER BY name')]
-    transfers = [dict(r) for r in db.execute('SELECT id,node_id,name,status,bytes_total,bytes_done,speed_bps,updated_at,error FROM transfers ORDER BY updated_at DESC LIMIT 50')]
+    transfers = [dict(r) for r in db.execute('SELECT id,node_id,name,status,phase,bytes_total,bytes_done,speed_bps,elapsed_seconds,transfer_seconds,updated_at,error FROM transfers ORDER BY updated_at DESC LIMIT 50')]
     for t in transfers: t['mode']='p2p'
     return dict(nodes=nodes,transfers=transfers,mcp_url=app.state.oauth_provider.base+'/mcp',version='1.1.0',update=update_status())
 
@@ -262,17 +276,22 @@ async def create_transfer(request:Request):
     platform=data.get('platform','linux_amd64'); asset=CFG['assets'].get(platform)
     if not asset: raise HTTPException(400,'Unsupported platform')
     transfer_id='transfer-'+secrets.token_hex(6); token=secrets.token_urlsafe(32); expires=time.time()+86400
+    stage = 'ssh_connect'
     try:
-        async with asyncssh.connect('127.0.0.1',port=node['port'],username=node['user'],client_keys=[str(ROOT/'keys'/node['id'])],known_hosts=str(ROOT/'.ssh'/'known_hosts'),connect_timeout=12) as conn:
-            # OpenSSH before 9.1 accepts local time only, without a UTC "Z" suffix.
-            stamp=await conn.run(f'date -d @{int(expires)} +%Y%m%d%H%M%S',check=True,timeout=10)
-            expiry=str(stamp.stdout).strip()
-            if not re.fullmatch(r'\d{14}',expiry): raise ValueError('Invalid target clock response')
-            line=f'restrict,expiry-time="{expiry}" {pub} fleet-{transfer_id}'
-            command='umask 077; mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/authorized_keys"; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/authorized_keys"; printf "\\n%s\\n" '+shlex.quote(line)+' >> "$HOME/.ssh/authorized_keys"'
-            await conn.run(command,check=True,timeout=15)
-    except Exception as e: raise HTTPException(502,'SSH enrollment failed: '+str(e))
-    db.execute('INSERT INTO transfers(id,node_id,name,token_hash,expires,status,bytes_total,updated_at) VALUES(?,?,?,?,?,?,?,?)',(transfer_id,node['id'],str(data.get('name','upload'))[:160],digest(token),expires,'connecting',max(0,int(data.get('bytes_total',0))),time.time())); db.commit()
+        async with asyncio.timeout(TRANSFER_PREPARE_TIMEOUT):
+            async with asyncssh.connect('127.0.0.1',port=node['port'],username=node['user'],client_keys=[str(ROOT/'keys'/node['id'])],known_hosts=str(ROOT/'.ssh'/'known_hosts'),connect_timeout=12) as conn:
+                # OpenSSH before 9.1 accepts local time only, without a UTC "Z" suffix.
+                stage = 'target_clock'
+                stamp=await conn.run(f'date -d @{int(expires)} +%Y%m%d%H%M%S',check=True,timeout=10)
+                expiry=str(stamp.stdout).strip()
+                if not re.fullmatch(r'\d{14}',expiry): raise ValueError('Invalid target clock response')
+                line=f'restrict,expiry-time="{expiry}" {pub} fleet-{transfer_id}'
+                command='umask 077; mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/authorized_keys"; chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/authorized_keys"; printf "\\n%s\\n" '+shlex.quote(line)+' >> "$HOME/.ssh/authorized_keys"'
+                stage = 'authorize_key'
+                await conn.run(command,check=True,timeout=15)
+    except TimeoutError: raise HTTPException(504,'SSH enrollment timed out during '+stage) from None
+    except Exception as e: raise HTTPException(502,'SSH enrollment failed during '+stage+': '+str(e))
+    db.execute('INSERT INTO transfers(id,node_id,name,token_hash,expires,status,phase,bytes_total,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(transfer_id,node['id'],str(data.get('name','upload'))[:160],digest(token),expires,'connecting','preparing_tool',max(0,int(data.get('bytes_total',0))),time.time())); db.commit()
     frpc=f'''serverAddr = "{CFG['host']}"
 serverPort = 7000
 user = "{transfer_id}"
@@ -303,5 +322,14 @@ async def progress(transfer_id:str,request:Request):
     if not row or not hmac.compare_digest(digest(bearer(request)),row['token_hash']): raise HTTPException(401)
     data=await request.json(); status=data.get('status','transferring')
     if status not in ('connecting','transferring','completed','failed'): raise HTTPException(400)
-    db.execute('UPDATE transfers SET status=?,bytes_done=?,speed_bps=?,updated_at=?,error=? WHERE id=?',(status,min(row['bytes_total'],max(0,int(data.get('bytes_done',0)))),max(0,float(data.get('speed_bps',0))),time.time(),str(data.get('error',''))[:1000],transfer_id)); db.commit()
+    phase = data.get('phase', status)
+    if not isinstance(phase, str) or phase not in TRANSFER_PHASES:
+        raise HTTPException(400, 'Invalid transfer phase')
+    timers = []
+    for name in ('elapsed_seconds', 'transfer_seconds'):
+        value = data.get(name)
+        if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+            raise HTTPException(400, 'Invalid '+name)
+        timers.append(value)
+    db.execute('UPDATE transfers SET status=?,phase=?,bytes_done=?,speed_bps=?,elapsed_seconds=COALESCE(?,elapsed_seconds),transfer_seconds=COALESCE(?,transfer_seconds),updated_at=?,error=? WHERE id=?',(status,phase,min(row['bytes_total'],max(0,int(data.get('bytes_done',0)))),max(0,float(data.get('speed_bps',0))),*timers,time.time(),str(data.get('error',''))[:1000],transfer_id)); db.commit()
     return {'ok':True}

@@ -166,13 +166,19 @@ class Progress:
     def __init__(self, hub: str, job: dict, total: int):
         self.hub, self.job, self.total = hub, job, total
         self.bytes_done, self.status, self.error = 0, "connecting", ""
+        self.phase = "preparing_tool"
         self.started = time.monotonic()
+        self.transfer_started = self.finished = None
         self.stop_event, self.lock = threading.Event(), threading.Lock()
         self.thread = threading.Thread(target=self.worker, daemon=True)
 
     def payload(self) -> dict:
         with self.lock:
-            return {"bytes_done": self.bytes_done, "speed_bps": self.bytes_done / max(time.monotonic() - self.started, 0.001), "status": self.status, "error": self.error}
+            now = self.finished if self.finished is not None else time.monotonic()
+            transfer_seconds = max(0, now - self.transfer_started) if self.transfer_started is not None else 0
+            speed = self.bytes_done / max(transfer_seconds, 0.001) if self.transfer_started is not None else 0
+            return {"bytes_done": self.bytes_done, "speed_bps": speed, "status": self.status, "error": self.error,
+                    "phase": self.phase, "elapsed_seconds": max(0, now - self.started), "transfer_seconds": transfer_seconds}
 
     def send(self) -> None:
         api(self.hub, f"/api/transfers/{urllib.parse.quote(str(self.job['id']), safe='')}/progress", self.job["token"], self.payload(), timeout=4)
@@ -185,19 +191,27 @@ class Progress:
                 # A transient monitoring failure must not redirect or corrupt data.
                 pass
 
-    def update(self, *, completed: int | None = None, status: str | None = None) -> None:
+    def update(self, *, completed: int | None = None, status: str | None = None, phase: str | None = None) -> None:
         with self.lock:
             if completed is not None:
                 self.bytes_done = completed
             if status is not None:
                 self.status = status
+                self.phase = status
+                if status == "transferring" and self.transfer_started is None:
+                    self.transfer_started = time.monotonic()
+            if phase is not None:
+                self.phase = phase
 
     def finish(self, status: str, error: str = "") -> None:
         self.stop_event.set()
+        with self.lock:
+            if self.finished is None:
+                self.finished = time.monotonic()
+            self.error = (f"{self.phase}: {error}" if error else "")[:1500]
+            self.status = self.phase = status
         if self.thread.is_alive():
             self.thread.join(timeout=6)
-        with self.lock:
-            self.status, self.error = status, error[:1500]
         for attempt in range(3):
             try:
                 self.send()
@@ -360,7 +374,8 @@ def main() -> int:
         public_key = generated.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).decode()
         private_key = generated.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption()).decode()
         ssh_key = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
-        job = api(args.hub, "/api/transfers", token, {"node_id": args.node, "name": source.name, "bytes_total": total, "public_key": public_key, "platform": system})
+        # The hub allows up to 40 seconds for SSH authorization preparation.
+        job = api(args.hub, "/api/transfers", token, {"node_id": args.node, "name": source.name, "bytes_total": total, "public_key": public_key, "platform": system}, timeout=45)
         progress = Progress(args.hub, job, total)
         progress.thread.start()
         print(f"Transfer {job['id']}: {len(files)} files, {total:,} bytes. P2P only; no relay fallback.", flush=True)
@@ -379,6 +394,7 @@ def main() -> int:
                 process = subprocess.Popen([str(binary), "-c", str(config)], stdout=log, stderr=subprocess.STDOUT,
                                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 try:
+                    progress.update(phase="connecting")
                     print(f"Waiting up to {args.connect_timeout} seconds for P2P/SSH connection.", flush=True)
                     client = connect_direct(job, ssh_key, port, process, log_path, args.connect_timeout)
                     print("Direct SSH connection established; uploading.", flush=True)
