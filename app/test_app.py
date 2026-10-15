@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def hub(tmp_path, monkeypatch):
+def hub(tmp_path, monkeypatch, request):
     (tmp_path / 'keys').mkdir()
     (tmp_path / '.ssh').mkdir()
     (tmp_path / 'ca.pem').write_text('synthetic test CA')
@@ -17,6 +17,7 @@ def hub(tmp_path, monkeypatch):
         'base_url': 'https://hub.test', 'host': 'hub.test',
         'admin_token': 'synthetic-admin-token', 'frp_dashboard_password': 'synthetic',
         'assets': {'linux_amd64': {'name': 'frp-test.tar.gz', 'sha256': '0' * 64}},
+        **getattr(request, 'param', {}),
     }))
     monkeypatch.setenv('FLEET_ROOT', str(tmp_path))
     spec = importlib.util.spec_from_file_location('fleet_test_app', Path(__file__).with_name('app.py'))
@@ -52,6 +53,19 @@ def test_admin_auth_and_state_shape(hub):
     response = client.get('/api/state', headers=ADMIN)
     assert response.status_code == 200
     assert response.json() == {'nodes': [], 'transfers': [], 'mcp_url': 'https://hub.test/mcp', 'version': '1.1.0', 'update': {}}
+
+
+@pytest.mark.parametrize('hub', [{'oauth_base_url': 'https://auth.hub.test'}], indirect=True)
+def test_oauth_domain_preserves_node_download_origin(hub):
+    _, client, _ = hub
+    assert client.get('/api/state', headers=ADMIN).json()['mcp_url'] == 'https://auth.hub.test/mcp'
+    metadata = client.get('/.well-known/oauth-authorization-server').json()
+    assert metadata['issuer'] == 'https://auth.hub.test/'
+    assert metadata['code_challenge_methods_supported'] == ['S256']
+    assert client.get('/api/agent-release').json()['url'] == 'https://hub.test/node.py'
+    assert 'https://hub.test' in client.get('/install.sh').text
+    command = client.post('/api/enrollments', headers=ADMIN, json={}).json()['command']
+    assert command.startswith('curl -fsSL https://hub.test/install.sh | ')
 
 
 @pytest.mark.parametrize('content', ['{incomplete', '[]', 'null'])

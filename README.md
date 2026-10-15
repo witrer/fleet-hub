@@ -24,6 +24,8 @@ ChatGPT 网页版添加自定义 MCP 时，填写 `https://YOUR_HUB/mcp`，鉴�
 
 已部署的旧版中枢先更新应用，再以 root 执行当前仓库的 `ops/enable_oauth.py`，将 Caddy 切换到 OAuth 验证入口。新安装会直接启用。OAuth 客户端和令牌保存在运行目录的 `oauth/`，与代码发布分离。
 
+需要为 OAuth 使用独立域名时，在运行目录 `config.json` 设置 `oauth_base_url`（例如 `https://fleet.example.com`），并在 Caddy 配置对应域名与可信证书。面板返回的 MCP URL、OAuth 发现、授权页与令牌资源使用该地址；节点安装、下载和更新继续使用原 `base_url`，已接入节点无需重新注册。切换 OAuth 地址后，在客户端重新连接以获取面向新资源的令牌；使用新连接页面生成的准确回调地址。重跑初始部署脚本前应保留自定义 Caddy 域名配置。
+
 Codex 等支持自定义请求头的客户端也可继续使用：
 
 | 配置 | 内容 |

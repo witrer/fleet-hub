@@ -118,7 +118,7 @@ class FleetOAuthProvider(FileOAuthProvider):
 
 
 def install_oauth(app, cfg, root):
-    base = cfg['base_url'].rstrip('/')
+    base = cfg.get('oauth_base_url', cfg['base_url']).rstrip('/')
     owner_token = cfg['admin_token']
     if not isinstance(owner_token, str) or not owner_token:
         raise ValueError('Fleet owner credential is required')

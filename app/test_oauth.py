@@ -33,10 +33,13 @@ class Inputs(HTMLParser):
             self.values[values['name']] = values.get('value', '')
 
 
-@pytest.fixture
-def oauth(tmp_path):
+@pytest.fixture(params=[False, True], ids=['shared-hub-origin', 'separate-oauth-origin'])
+def oauth(tmp_path, request):
     app = FastAPI()
-    provider = install_oauth(app, {'base_url': BASE, 'admin_token': OWNER}, tmp_path)
+    config = {'base_url': BASE, 'admin_token': OWNER}
+    if request.param:
+        config.update(base_url='https://node-downloads.test', oauth_base_url=BASE)
+    provider = install_oauth(app, config, tmp_path)
     assert app.state.oauth_provider is provider
     with TestClient(app, base_url=BASE, follow_redirects=False) as client:
         yield client

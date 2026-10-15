@@ -116,7 +116,7 @@ async def state(request:Request):
     nodes = [public_node(r) for r in db.execute('SELECT * FROM nodes WHERE active=1 ORDER BY name')]
     transfers = [dict(r) for r in db.execute('SELECT id,node_id,name,status,bytes_total,bytes_done,speed_bps,updated_at,error FROM transfers ORDER BY updated_at DESC LIMIT 50')]
     for t in transfers: t['mode']='p2p'
-    return dict(nodes=nodes,transfers=transfers,mcp_url=BASE+'/mcp',version='1.1.0',update=update_status())
+    return dict(nodes=nodes,transfers=transfers,mcp_url=app.state.oauth_provider.base+'/mcp',version='1.1.0',update=update_status())
 
 def active_node(node_id):
     if not db.execute('SELECT 1 FROM nodes WHERE id=? AND active=1', (node_id,)).fetchone():
