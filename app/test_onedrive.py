@@ -54,17 +54,22 @@ def provider(tmp_path):
         asyncio.run(client.aclose())
 
 
-def test_upload_contract_and_refresh_persistence(provider):
+@pytest.mark.parametrize('size', [10, 499 * 1024**2])
+def test_upload_contract_and_refresh_persistence(provider, size):
     calls = []
     def handle(request):
         calls.append(request)
         assert request.method == 'POST'
         assert request.url.path == '/v1.0/drives/test-drive/items/test-folder:/test-name:/createUploadSession'
-        assert json.loads(request.content) == {'item': {'@microsoft.graph.conflictBehavior': 'fail',
-                                                        'name': 'test-name', 'fileSize': 10}}
+        payload = json.loads(request.content)
+        # Reproduce the reported personal OneDrive rejection before returning a session.
+        if 'fileSize' in payload.get('item', {}):
+            return httpx.Response(400, json={'error': {'code': 'invalidRequest'}})
+        assert payload == {'item': {'@microsoft.graph.conflictBehavior': 'fail',
+                                    'name': 'test-name'}}
         return httpx.Response(200, json={'uploadUrl': UPLOAD, 'expirationDateTime': EXPIRY})
     item = provider(handle)
-    result = asyncio.run(item.create_upload('test-name', 10))
+    result = asyncio.run(item.create_upload('test-name', size))
     assert result == {'upload_url': UPLOAD, 'expires_at': 1893456000.0}
     assert json.loads(item.token_path.read_text()) == {'refresh_token': 'synthetic-new-refresh'}
     assert item.token_path.stat().st_mode & 0o777 == 0o600

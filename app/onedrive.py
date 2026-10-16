@@ -279,9 +279,11 @@ class OneDrive:
         name = _name(name)
         if not _integer(size) or size == 0:
             raise ProviderError('invalid_file_size', 400)
+        # Personal OneDrive can reject item.fileSize. Total bytes are sent in
+        # each upload PUT's Content-Range and checked against the saved manifest.
         data, _ = await self._graph('POST', self._child_path(name) + ':/createUploadSession',
                                    json={'item': {'@microsoft.graph.conflictBehavior': 'fail',
-                                                  'name': name, 'fileSize': size}})
+                                                  'name': name}})
         return {'upload_url': _https_url(data.get('uploadUrl')),
                 'expires_at': _expiry(data.get('expirationDateTime'))}
 

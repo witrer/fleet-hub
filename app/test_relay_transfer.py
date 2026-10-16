@@ -137,6 +137,29 @@ def test_manifest_size_and_file_directory_conflict(relay):
     assert client.post('/api/relay/transfers', headers=ADMIN, json=data).status_code == 400
 
 
+def test_rejected_session_can_retry_existing_task(relay, monkeypatch):
+    module, client, _, provider = relay
+    job = create(relay)
+    file = job['files'][0]
+    path = f"/api/relay/transfers/{job['id']}/files/{file['id']}/session"
+    create_upload = provider.create_upload
+
+    async def rejected(name, size):
+        raise ProviderError('provider_rejected', 400)
+
+    monkeypatch.setattr(provider, 'create_upload', rejected)
+    assert client.post(path, headers=ADMIN, json={}).status_code == 400
+    assert module.relay_transfers.file(job['id'], file['id'])['upload_url'] is None
+    assert client.get('/api/relay/transfers/'+job['id'], headers=ADMIN).json()['status'] == 'uploading'
+
+    monkeypatch.setattr(provider, 'create_upload', create_upload)
+    response = client.post(path, headers=ADMIN, json={})
+    assert response.status_code == 200
+    assert response.json()['next_offset'] == 0
+    assert create(relay)['id'] == job['id']
+    assert module.db.execute('SELECT count(*) FROM relay_jobs').fetchone()[0] == 1
+
+
 def test_session_resume_expiry_and_lost_final_response(relay):
     module, client, _, provider = relay
     job = create(relay)
