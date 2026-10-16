@@ -169,6 +169,31 @@ def test_web_login_atomic_config_merge_and_no_token_leak(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('verification_uri', [
+    'https://www.microsoft.com/link',
+    'https://microsoft.com/link',
+    'https://microsoft.com/devicelogin',
+    'https://www.microsoft.com/devicelogin',
+])
+def test_device_verification_uri_is_preserved_across_web_login_endpoints(tmp_path, verification_uri):
+    async def scenario():
+        ms = Microsoft()
+        ms.device['verification_uri'] = verification_uri
+        async with harness(tmp_path, blocked=True, microsoft=ms) as (_, client, _, _, _, _):
+            response = await start(client)
+            assert response.status_code == 200
+            session = response.json()
+            polled = await client.get('/api/storage/onedrive/login/' + session['session_id'], headers=HEADERS)
+            status = await client.get('/api/storage/onedrive', headers=HEADERS)
+            assert polled.status_code == status.status_code == 200
+            for payload in (session, polled.json(), status.json()['login']):
+                assert payload['verification_uri'] == verification_uri
+                assert payload['user_code'] == DEVICE['user_code']
+                assert payload['status'] == 'pending'
+            assert len(ms.calls) == 1
+    asyncio.run(scenario())
+
+
 def test_admin_and_origin_required_before_any_upstream_request(tmp_path):
     async def scenario():
         async with harness(tmp_path) as (_, client, _, _, ms, _):

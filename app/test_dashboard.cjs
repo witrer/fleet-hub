@@ -244,6 +244,39 @@ const testClientId='00000000-1111-2222-3333-444444444444';
 const settingsStatus=(extra={})=>({configured:false,connected:false,auth_state:'unconfigured',client_id:testClientId,quota:null,error_code:null,login:null,can_switch_account:true,...extra});
 const loginSession=(h,extra={})=>({session_id:'public-session',status:'pending',user_code:'ABCD-EFGH',verification_uri:'https://microsoft.com/devicelogin',expires_at:h.now()/1000+900,interval:5,error_code:null,...extra});
 
+test('Microsoft link and device login entries render exactly as returned without a false error',async()=>{
+  for(const verification_uri of ['https://www.microsoft.com/link','https://microsoft.com/link',
+    'https://microsoft.com/devicelogin','https://www.microsoft.com/devicelogin',
+    'https://login.microsoftonline.com/common/oauth2/deviceauth']){
+    const h=harness();h.ui.setState(snapshot([]));h.ui.setToken('synthetic');
+    h.fetch(()=>settingsStatus({login:loginSession(h,{verification_uri,user_code:'TEST1234'})}));
+    h.ui.selectPage('settings');await flush();
+    assert.equal(h.el('onedrive-login-link').hidden,false,verification_uri);
+    assert.equal(h.el('onedrive-login-link').attributes.href,verification_uri);
+    assert.equal(h.el('onedrive-user-code').textContent,'TEST1234');
+    assert.equal(h.el('onedrive-copy-code').disabled,false);
+    assert.equal(h.el('onedrive-error').textContent,'');
+    assert.equal(h.el('onedrive-connection').textContent,'等待网页登录');
+  }
+});
+
+test('missing device login fields report an invalid response without inventing a URL or code',async()=>{
+  for(const missing of [['verification_uri'],['user_code'],['verification_uri','user_code']]){
+    const h=harness(),session=loginSession(h);for(const key of missing)delete session[key];
+    h.ui.setState(snapshot([]));h.ui.setToken('synthetic');h.fetch(()=>settingsStatus({login:session}));
+    h.ui.selectPage('settings');await flush();
+    assert.match(h.el('onedrive-error').textContent,/无法验证登录信息/);
+    if(missing.includes('verification_uri')){
+      assert.equal(h.el('onedrive-login-link').hidden,true);
+      assert.equal(h.el('onedrive-login-link').attributes.href,undefined);
+    }
+    if(missing.includes('user_code')){
+      assert.equal(h.el('onedrive-user-code').textContent,'');
+      assert.equal(h.el('onedrive-copy-code').disabled,true);
+    }
+  }
+});
+
 test('device login displays only official link and public code, pauses off page, and confirms connection',async()=>{
   const h=harness(),state=snapshot([node(h)]);let started=false,connected=false;h.ui.setState(state);h.ui.setToken('synthetic');
   h.fetch((url,options)=>{
@@ -275,7 +308,11 @@ test('cancelling login ignores a late connected response and does not restart po
 test('untrusted login URLs and unknown provider errors are never echoed as actionable content',async()=>{
   const h=harness();h.ui.setState(snapshot([]));h.ui.setToken('synthetic');h.fetch(()=>settingsStatus({login:loginSession(h,{verification_uri:'https://microsoft.com.evil.test/devicelogin'})}));h.ui.selectPage('settings');await flush();
   assert.equal(h.el('onedrive-login-link').hidden,true);assert.equal(h.el('onedrive-login-link').attributes.href,undefined);assert.match(h.el('onedrive-error').textContent,/无法验证登录信息/);
-  for(const url of ['javascript:alert(1)','https://microsoft.com@evil.test/devicelogin','https://microsoft.com/devicelogin?redirect=https://evil.test','http://microsoft.com/devicelogin'])assert.equal(h.ui.safeVerificationUrl(url),null);
+  for(const url of ['javascript:alert(1)','https://microsoft.com@evil.test/devicelogin','https://microsoft.com/devicelogin?redirect=https://evil.test','http://microsoft.com/devicelogin',
+    'https://www.microsoft.com.evil.test/link','https://www.microsoft.com@evil.test/link',
+    'http://www.microsoft.com/link','https://www.microsoft.com:8443/link',
+    'https://www.microsoft.com/link?redirect=https://evil.test','https://www.microsoft.com/link#other',
+    'https://www.microsoft.com/unknown','https://login.microsoftonline.com/link'])assert.equal(h.ui.safeVerificationUrl(url),null);
   h.fetch(()=>{throw new Error('raw-provider-secret-detail');});await h.ui.loadOneDriveSettings();assert.equal(h.el('onedrive-error').textContent,'登录未完成，请重试。');assert.doesNotMatch(h.el('onedrive-error').textContent,/raw-provider/);assert.equal(h.el('onedrive-connection').textContent,'连接状态暂不可确认');
 });
 
