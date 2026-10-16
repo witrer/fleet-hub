@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,7 +26,9 @@ def hub(tmp_path, monkeypatch):
     target = Path(os.environ.get('FLEET_PROBE_APP', default)).resolve()
     monkeypatch.syspath_prepend(str(target.parent))
     oauth = importlib.import_module('fleet_oauth')
-    monkeypatch.setattr(oauth, 'install_oauth', lambda *args: None)
+    def install_oauth_stub(app, cfg, root):
+        app.state.oauth_provider = SimpleNamespace(base=cfg['base_url'])
+    monkeypatch.setattr(oauth, 'install_oauth', install_oauth_stub)
     for name in ('keys', '.ssh'):
         (tmp_path / name).mkdir()
     (tmp_path / 'config.json').write_text(json.dumps({
@@ -64,9 +68,54 @@ def test_node_credentials_are_bound_to_the_registered_node(hub):
     assert client.post(path, headers=NODE_AUTH, json={'cpu_percent': 5}).status_code == 200
 
 
+def test_agent_update_observation_only_exposes_display_fields(hub):
+    _, client = hub
+    update = {'status': 'rolled_back', 'version': 'test-version', 'checked_at': NOW-20,
+              'updated_at': NOW-10, 'error': 'startup_timeout',
+              'private_path': '/do-not-expose', 'rejected': ['internal-detail'], 'token': 'test-only'}
+    assert client.post('/api/nodes/' + NODE + '/heartbeat', headers=NODE_AUTH,
+                       json={'agent_version': 'previous', 'agent_update': update}).status_code == 200
+    state = client.get('/api/state', headers=ADMIN).json()
+    node = next(item for item in state['nodes'] if item['id'] == NODE)
+    assert node['agent_version'] == 'previous'
+    assert node['agent_update'] == {key: update[key] for key in
+                                   ('status', 'version', 'checked_at', 'updated_at', 'error')}
+
+
+def test_network_monitoring_keeps_real_rates_and_own_sampling_time(hub):
+    module, client = hub
+    payload = {'metrics_status': 'error', 'network_status': 'ok', 'network_sampled_at': NOW - 1,
+               'network_rx_bps': 2097152, 'network_tx_bps': 524288, 'network_rx': 123456789,
+               'network_tx': 987654321, 'network_rx_errors': 2, 'network_tx_dropped': 3,
+               'network_interfaces': ['ens3'], 'network_scope': 'default_route',
+               'network_counter_scope': 'interface_lifetime', 'network_interval_seconds': 10}
+    path = '/api/nodes/' + NODE + '/heartbeat'
+    assert client.post(path, headers=NODE_AUTH, json=payload).status_code == 200
+    assert client.post(path, headers=NODE_AUTH, json=payload).status_code == 200
+    state = client.get('/api/state', headers=ADMIN).json()
+    node = next(value for value in state['nodes'] if value['id'] == NODE)
+    assert node['network_rx_bps'] == 2097152
+    assert node['network_interfaces'] == ['ens3']
+    assert node['network_rx_errors'] == 2 and node['network_tx_dropped'] == 3
+    history = client.get('/api/nodes/' + NODE + '/history?metric=network_rx', headers=ADMIN).json()
+    assert history['unit'] == 'bytes_per_second'
+    assert history['points'][-1]['value'] == 2097152
+    row = module.db.execute('SELECT resources FROM probe_minutes WHERE node_id=? AND minute=?',
+                            (NODE, NOW // 60 * 60)).fetchone()
+    assert json.loads(row['resources'])['network_rx']['count'] == 1
+    assert client.get('/api/nodes/' + NODE + '/history?metric=network_tx&device=0', headers=ADMIN).status_code == 400
+    stale = dict(payload, network_sampled_at=NOW - 36)
+    assert client.post(path, headers=NODE_AUTH, json=stale).status_code == 200
+    state = client.get('/api/state', headers=ADMIN).json()
+    node = next(value for value in state['nodes'] if value['id'] == NODE)
+    assert node['network_status'] == 'stale' and node['network_rx_bps'] is None
+    assert node['network_rx'] == 123456789
+
+
 def test_new_probe_metrics_history_and_summary_preserve_real_measurements(hub):
     module, client = hub
     module.proxy_status[NODE + '.ssh'] = 'online'
+    module.proxy_status_updated = module.time.monotonic()
     samples = [{'timestamp': NOW - 30 + i, 'success': True, 'latency_ms': 10 if i < 18 else 1000} for i in range(20)]
     data = {'cpu_percent': 22, 'memory_percent': 33, 'disk_percent': 44,
             'memory_used_bytes': 200, 'memory_total_bytes': 800, 'disk_used_bytes': 1000, 'disk_total_bytes': 2000,
@@ -96,6 +145,98 @@ def test_new_probe_metrics_history_and_summary_preserve_real_measurements(hub):
     assert summary['nodes'][NODE]['p95_ms'] == 1000
     assert summary['nodes'][NODE]['avg_ms'] == 109
     assert all(bucket['status'] == 'unknown' for bucket in summary['nodes'][OTHER]['buckets'])
+
+
+@pytest.mark.parametrize('metadata,status,age', [
+    ({'metrics_status': 'ok', 'metrics_sampled_at': NOW - 2}, 'fresh', 2),
+    ({'metrics_status': 'ok', 'metrics_sampled_at': NOW - 35}, 'stale', 35),
+    ({'metrics_status': 'collecting', 'metrics_sampled_at': None}, 'unknown', None),
+    ({'metrics_status': 'stale', 'metrics_sampled_at': NOW - 40}, 'stale', 40),
+    ({'metrics_status': 'error', 'metrics_sampled_at': NOW - 1, 'metrics_error': 'resource collection failed'}, 'stale', 1),
+    ({'metrics_status': 'ok', 'metrics_sampled_at': NOW + 61}, 'stale', 0),
+    ({}, 'fresh', 0),
+])
+def test_state_distinguishes_resource_sampling_from_heartbeat_freshness(hub, metadata, status, age):
+    _, client = hub
+    assert client.post('/api/nodes/' + NODE + '/heartbeat', headers=NODE_AUTH, json=metadata).status_code == 200
+    node = next(item for item in client.get('/api/state', headers=ADMIN).json()['nodes'] if item['id'] == NODE)
+    assert node['heartbeat_freshness'] == {'status': 'fresh', 'age_seconds': 0, 'sampled_at': NOW}
+    assert node['freshness']['status'] == status
+    assert node['metrics_age_seconds'] == age
+    assert node['metrics_stale'] is (status != 'fresh')
+    if 'metrics_status' in metadata:
+        assert node['metrics_status'] == metadata['metrics_status']
+        assert node['freshness']['sampled_at'] == metadata['metrics_sampled_at']
+
+
+def test_reused_resource_sample_is_not_recorded_again_after_store_restart_and_minute_boundary(hub, monkeypatch):
+    module, client = hub
+    first_at = NOW // 60 * 60 + 58
+    monkeypatch.setattr(module.time, 'time', lambda: first_at)
+    path = '/api/nodes/' + NODE + '/heartbeat'
+    data = {'cpu_percent': 10, 'memory_percent': 20, 'disk_percent': 30,
+            'metrics_status': 'ok', 'metrics_sampled_at': first_at - 1,
+            'gpus': [{'index': 0, 'util_percent': 20}],
+            'latency_sample_at': first_at - 1, 'latency_ms': 10}
+    assert client.post(path, headers=NODE_AUTH, json=data).status_code == 200
+    # A new store has no process-local dedup state. The persisted node sample
+    # timestamp still prevents repeated cached CPU/memory/disk observations.
+    module.probes = type(module.probes)(module.db)
+    later = first_at + 4
+    monkeypatch.setattr(module.time, 'time', lambda: later)
+    data.update(gpus=[{'index': 0, 'util_percent': 80}], latency_sample_at=later - 1, latency_ms=30)
+    assert client.post(path, headers=NODE_AUTH, json=data).status_code == 200
+    for metric in ('cpu', 'memory', 'disk'):
+        history = client.get('/api/nodes/' + NODE + '/history?metric=' + metric, headers=ADMIN).json()
+        assert history['points'][-2]['value'] is not None
+        assert history['points'][-1]['value'] is None
+    gpu_history = client.get('/api/nodes/' + NODE + '/history?metric=gpu', headers=ADMIN).json()
+    assert gpu_history['points'][-2]['value'] == 20
+    assert gpu_history['points'][-1]['value'] == 80
+    summary = client.get('/api/latency/summary', headers=ADMIN).json()['nodes'][NODE]
+    assert sum(bucket['sample_count'] for bucket in summary['buckets']) == 2
+    assert summary['avg_ms'] == 20
+    data.update(metrics_sampled_at=later, cpu_percent=90)
+    assert client.post(path, headers=NODE_AUTH, json=data).status_code == 200
+    history = client.get('/api/nodes/' + NODE + '/history?metric=cpu', headers=ADMIN).json()
+    assert history['points'][-1]['value'] == 90
+
+
+@pytest.mark.parametrize('metadata', [
+    {'metrics_status': 'collecting', 'metrics_sampled_at': None},
+    {'metrics_status': 'error', 'metrics_sampled_at': NOW - 1},
+    {'metrics_status': 'ok', 'metrics_sampled_at': NOW - 35},
+    {'metrics_status': 'ok', 'metrics_sampled_at': NOW + 61},
+    {'metrics_status': 'ok', 'metrics_sampled_at': None},
+])
+def test_unsuccessful_or_invalid_resource_observation_is_not_added_to_history(hub, metadata):
+    _, client = hub
+    data = dict(metadata, cpu_percent=90, memory_percent=80, disk_percent=70,
+                gpus=[{'index': 0, 'util_percent': 50}], latency_sample_at=NOW - 1, latency_ms=10)
+    assert client.post('/api/nodes/' + NODE + '/heartbeat', headers=NODE_AUTH, json=data).status_code == 200
+    for metric in ('cpu', 'memory', 'disk'):
+        history = client.get('/api/nodes/' + NODE + '/history?metric=' + metric, headers=ADMIN).json()
+        assert history['stats']['avg'] is None
+    gpu_history = client.get('/api/nodes/' + NODE + '/history?metric=gpu', headers=ADMIN).json()
+    assert gpu_history['stats']['avg'] == 50
+    assert client.get('/api/latency/summary', headers=ADMIN).json()['nodes'][NODE]['avg_ms'] == 10
+
+
+def test_state_fetches_manual_locations_without_per_node_metadata_reads(hub):
+    module, client = hub
+    module.probes.set_location(NODE, {'country_code': 'JP', 'city': 'Tokyo'})
+    queries = []
+    module.db.set_trace_callback(queries.append)
+    try:
+        response = client.get('/api/state', headers=ADMIN)
+    finally:
+        module.db.set_trace_callback(None)
+    assert response.status_code == 200
+    nodes = {item['id']: item for item in response.json()['nodes']}
+    assert nodes[NODE]['country_code'] == 'JP'
+    assert nodes[OTHER]['location_source'] == 'unknown'
+    assert not any(query.startswith('SELECT manual_location FROM probe_metadata') for query in queries)
+    assert sum('LEFT JOIN probe_metadata' in query for query in queries) == 1
 
 
 def test_manual_location_cannot_be_overwritten_by_node_heartbeat(hub):
@@ -143,3 +284,58 @@ def test_gpu_device_history_and_invalid_api_parameters(hub):
     for node_id in ('missing', REVOKED):
         assert client.get('/api/nodes/' + node_id + '/history', headers=ADMIN).status_code == 404
         assert client.put('/api/nodes/' + node_id + '/location', headers=ADMIN, json={}).status_code == 404
+
+
+def test_summary_cache_reuses_calculation_across_requests_and_heartbeats(hub, monkeypatch):
+    module, client = hub
+    module.probes.record(NODE, {'latency_ms': 150, 'latency_sample_at': NOW - 1}, NOW)
+    calculate = mock.Mock(wraps=module.probes.latency_summary)
+    monkeypatch.setattr(module.probes, 'latency_summary', calculate)
+    first = client.get('/api/latency/summary', headers=ADMIN)
+    assert first.status_code == 200
+    assert client.post('/api/nodes/' + NODE + '/heartbeat', headers=NODE_AUTH,
+                       json={'latency_ms': 50, 'latency_sample_at': NOW}).status_code == 200
+    repeated = client.get('/api/latency/summary', headers=ADMIN)
+    assert repeated.status_code == 200
+    assert repeated.json() == first.json()
+    assert repeated.json()['nodes'][NODE]['avg_ms'] == 150
+    assert calculate.call_count == 1
+
+
+def test_summary_cache_isolates_both_threshold_parameters(hub, monkeypatch):
+    module, client = hub
+    module.probes.record(NODE, {'latency_ms': 150, 'latency_sample_at': NOW - 1}, NOW)
+    calculate = mock.Mock(wraps=module.probes.latency_summary)
+    monkeypatch.setattr(module.probes, 'latency_summary', calculate)
+    for query, expected in [('', 'degraded'), ('?healthy_ms=200', 'healthy'),
+                            ('?critical_ms=120', 'critical'), ('?healthy_ms=200', 'healthy')]:
+        response = client.get('/api/latency/summary' + query, headers=ADMIN)
+        assert response.status_code == 200
+        assert response.json()['nodes'][NODE]['buckets'][-1]['status'] == expected
+    assert calculate.call_count == 3
+
+
+def test_summary_cache_immediately_removes_node_after_revoke(hub, monkeypatch):
+    module, client = hub
+    calculate = mock.Mock(wraps=module.probes.latency_summary)
+    monkeypatch.setattr(module.probes, 'latency_summary', calculate)
+    first = client.get('/api/latency/summary', headers=ADMIN)
+    assert first.status_code == 200
+    assert set(first.json()['nodes']) == {NODE, OTHER}
+    assert client.post('/api/nodes/' + OTHER + '/revoke', headers=ADMIN).status_code == 200
+    current = client.get('/api/latency/summary', headers=ADMIN)
+    assert current.status_code == 200
+    assert set(current.json()['nodes']) == {NODE}
+    assert calculate.call_count == 2
+
+
+def test_warm_summary_cache_does_not_bypass_auth_or_parameter_validation(hub, monkeypatch):
+    module, client = hub
+    calculate = mock.Mock(wraps=module.probes.latency_summary)
+    monkeypatch.setattr(module.probes, 'latency_summary', calculate)
+    assert client.get('/api/latency/summary', headers=ADMIN).status_code == 200
+    for headers in ({}, {'Authorization': 'Bearer wrong'}, NODE_AUTH):
+        assert client.get('/api/latency/summary', headers=headers).status_code == 401
+    for query in ('healthy_ms=-1', 'healthy_ms=251&critical_ms=250', 'healthy_ms=nan', 'critical_ms=inf'):
+        assert client.get('/api/latency/summary?' + query, headers=ADMIN).status_code == 400
+    assert calculate.call_count == 1

@@ -66,7 +66,8 @@ class Updater:
             ])
 
     def write_status(self, status, message, **fields):
-        self.status.update(status=status, message=message[:1000], **fields)
+        summary = message if len(message) <= 1000 else message[:200] + '\n...\n' + message[-795:]
+        self.status.update(status=status, message=summary, **fields)
         atomic_json(self.status_path, self.status)
         print(status + ': ' + message, flush=True)
 
@@ -85,16 +86,38 @@ class Updater:
             raise RuntimeError('Git returned an invalid commit ID')
         return commit
 
+    def reusable_vendor(self, dependency_key):
+        """Reuse only a prepared active release, with independent files for rollback."""
+        try:
+            previous = self.current.resolve(strict=True)
+            metadata = json.loads((previous / 'release.json').read_text())
+            vendor = previous / 'vendor'
+            if (metadata.get('dependency_key') == dependency_key and vendor.is_dir()
+                    and not vendor.is_symlink()
+                    and not any(path.is_symlink() for path in vendor.rglob('*'))):
+                return vendor
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return None
+
     def prepare(self, commit):
+        started = time.monotonic()
         release = self.releases / commit
         self.releases.mkdir(parents=True, exist_ok=True)
         if release.exists():
             shutil.rmtree(release)
         staging = Path(tempfile.mkdtemp(prefix='.prepare-', dir=self.releases))
         try:
+            wheels_tree = self.command(['git', '-C', str(self.repo), 'rev-parse', commit + ':wheels'])
+            python_runtime = json.loads(self.command([self.python, '-c',
+                'import json, platform, sys; print(json.dumps([sys.version, sys.executable, '
+                'sys.prefix, platform.machine()]))']))
+            dependency_key = {'wheels_tree': wheels_tree, 'python': python_runtime}
+            cached_vendor = self.reusable_vendor(dependency_key)
             archive = staging / 'source.tar'
             with archive.open('wb') as output:
-                subprocess.run(['git', '-C', str(self.repo), 'archive', commit, 'app', 'wheels'],
+                subprocess.run(['git', '-C', str(self.repo), 'archive', commit, 'app',
+                                *([] if cached_vendor else ['wheels'])],
                                env=self.env, stdout=output, stderr=subprocess.PIPE, check=True, timeout=60)
             with tarfile.open(archive) as package:
                 package.extractall(staging, filter='data')
@@ -112,11 +135,15 @@ class Updater:
                 shutil.rmtree(downloads)
             downloads.symlink_to(self.base / 'shared' / 'downloads', target_is_directory=True)
             vendor = staging / 'vendor'
-            vendor.mkdir()
-            wheels = sorted((staging / 'wheels').glob('*.whl'))
-            if wheels:
-                self.command([self.python, '-m', 'pip', 'install', '--no-index', '--no-deps',
-                              '--no-compile', '--target', str(vendor), *map(str, wheels)])
+            if cached_vendor:
+                # Do not hard-link or share a mutable vendor across rollback releases.
+                shutil.copytree(cached_vendor, vendor)
+            else:
+                vendor.mkdir()
+                wheels = sorted((staging / 'wheels').glob('*.whl'))
+                if wheels:
+                    self.command([self.python, '-m', 'pip', 'install', '--no-index', '--no-deps',
+                                  '--no-compile', '--target', str(vendor), *map(str, wheels)])
             self.command([self.python, '-m', 'compileall', '-q', str(staging / 'app')])
             env = dict(self.env, PYTHONPATH=str(vendor))
             dependency_check = '''
@@ -134,7 +161,14 @@ for distribution in metadata.distributions(path=[os.environ['PYTHONPATH']]):
 import fastapi, uvicorn, httpx, asyncssh, relay_shell.server
 '''
             self.command([self.python, '-c', dependency_check], env=env)
-            atomic_json(staging / 'release.json', {'commit': commit, 'prepared_at': now()})
+            # Wheels remain recoverable from Git and are not needed by the running release.
+            if (staging / 'wheels').exists():
+                shutil.rmtree(staging / 'wheels')
+            atomic_json(staging / 'release.json', {
+                'commit': commit, 'prepared_at': now(), 'dependency_key': dependency_key,
+                'dependencies_reused': cached_vendor is not None,
+                'prepare_seconds': round(time.monotonic() - started, 3),
+            })
             # tempfile directories default to 0700; services run as fleet.
             for directory, _, files in os.walk(staging, followlinks=False):
                 Path(directory).chmod(0o755)
@@ -214,6 +248,9 @@ import fastapi, uvicorn, httpx, asyncssh, relay_shell.server
                 return 0
             self.write_status('updating', 'Preparing ' + target[:12])
             release = self.prepare(target)
+            prepared = json.loads((release / 'release.json').read_text())
+            self.status.update(prepare_seconds=prepared['prepare_seconds'],
+                               dependencies_reused=prepared['dependencies_reused'])
             activated = True
             switch(self.current, release)
             self.restart()

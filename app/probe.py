@@ -1,6 +1,7 @@
 """Minute resource aggregates and exact heartbeat RTT history for Fleet's SQLite DB."""
 from __future__ import annotations
 
+from collections import OrderedDict
 import ipaddress
 import json
 import math
@@ -10,11 +11,19 @@ import time
 RETENTION = 48 * 3600
 PERCENT_FIELDS = ('cpu_percent', 'memory_percent', 'disk_percent', 'gpu_percent')
 BYTE_FIELDS = ('memory_used_bytes', 'memory_total_bytes', 'disk_used_bytes', 'disk_total_bytes',
-               'network_rx', 'network_tx')
+               'network_rx', 'network_tx', 'network_rx_errors', 'network_tx_errors',
+               'network_rx_dropped', 'network_tx_dropped')
+NETWORK_RATES = ('network_rx_bps', 'network_tx_bps')
+NETWORK_STATUSES = {'collecting', 'ok', 'reset', 'unavailable', 'error', 'stale'}
 LOCATION_FIELDS = ('country_code', 'country_name', 'region', 'city')
-METRICS = {'cpu': 'cpu_percent', 'memory': 'memory_percent', 'disk': 'disk_percent', 'gpu': 'gpu_percent'}
+METRICS = {'cpu': 'cpu_percent', 'memory': 'memory_percent', 'disk': 'disk_percent', 'gpu': 'gpu_percent',
+           'network_rx': 'network_rx_bps', 'network_tx': 'network_tx_bps'}
 RANGES = {'1h': 3600, '6h': 21600, '24h': 86400}
 GPU_STATUSES = {'ok', 'no_gpu', 'driver_missing', 'permission_denied', 'error', 'unsupported'}
+METRICS_STATUSES = {'collecting', 'ok', 'stale', 'error'}
+LATENCY_SUMMARY_TTL = 15
+LATENCY_SUMMARY_CACHE_LIMIT = 4
+_UNSET = object()
 
 
 def number(value, minimum=0, maximum=None):
@@ -85,12 +94,55 @@ def clean_metrics(payload):
     for key in BYTE_FIELDS:
         if key in payload:
             result[key] = integer(payload[key])
+    for key in NETWORK_RATES:
+        if key in payload:
+            result[key] = number(payload[key], maximum=2**63-1)
+    for key in ('network_sampled_at', 'network_interval_seconds'):
+        if key in payload:
+            result[key] = number(payload[key])
+    if 'network_status' in payload:
+        status = payload['network_status']
+        result['network_status'] = status if isinstance(status, str) and status in NETWORK_STATUSES else 'error'
+        if result['network_status'] != 'ok':
+            result.update(network_rx_bps=None, network_tx_bps=None)
+    if 'network_scope' in payload:
+        scope = payload['network_scope']
+        result['network_scope'] = scope if isinstance(scope, str) and scope in (
+            'default_route', 'physical', 'non_virtual', 'unavailable') else 'unavailable'
+    if payload.get('network_counter_scope') == 'interface_lifetime':
+        result['network_counter_scope'] = 'interface_lifetime'
+    if 'network_interfaces' in payload:
+        interfaces = payload['network_interfaces']
+        result['network_interfaces'] = list(dict.fromkeys(value for value in interfaces[:16]
+            if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:@-]{1,64}', value))) if isinstance(interfaces, list) else []
     for key in ('uptime', 'load'):
         if key in payload:
             result[key] = number(payload[key])
     for key, length in (('platform', 100), ('agent_version', 64), ('gpu_error', 240)):
         if isinstance(payload.get(key), str):
             result[key] = payload[key][:length]
+    if type(payload.get('relay_protocol')) is int and payload['relay_protocol'] == 1:
+        result['relay_protocol'] = 1
+    if 'metrics_status' in payload:
+        value = payload['metrics_status']
+        result['metrics_status'] = value if isinstance(value, str) and value in METRICS_STATUSES else 'error'
+    if 'metrics_sampled_at' in payload:
+        result['metrics_sampled_at'] = number(payload['metrics_sampled_at'])
+    if 'metrics_error' in payload:
+        value = payload['metrics_error']
+        result['metrics_error'] = value[:240] if isinstance(value, str) else None
+    update = payload.get('agent_update')
+    if isinstance(update, dict):
+        public = {}
+        if update.get('status') in ('idle', 'pending', 'deferred', 'confirmed', 'rolled_back', 'check_failed'):
+            public['status'] = update['status']
+        for key, length in (('version', 64), ('error', 120)):
+            if isinstance(update.get(key), str):
+                public[key] = update[key][:length]
+        for key in ('checked_at', 'updated_at'):
+            if key in update:
+                public[key] = number(update[key])
+        result['agent_update'] = public
     if 'gpu_status' in payload:
         value = payload['gpu_status']
         result['gpu_status'] = value if isinstance(value, str) and value in GPU_STATUSES else 'error'
@@ -152,6 +204,7 @@ class ProbeStore:
         self.db = db
         self.observations = {}
         self.last_cleanup = 0
+        self._latency_summary_cache = OrderedDict()
         db.executescript('''
 CREATE TABLE IF NOT EXISTS probe_minutes (
  node_id TEXT NOT NULL, minute INTEGER NOT NULL, resources TEXT NOT NULL DEFAULT '{}',
@@ -182,12 +235,15 @@ CREATE TABLE IF NOT EXISTS probe_metadata (
             self.db.execute('DELETE FROM probe_minutes WHERE minute<?', (int(now - RETENTION) // 60 * 60,))
             self.last_cleanup = now
 
-    def record(self, node_id, metrics, now=None):
+    def record(self, node_id, metrics, now=None, *, record_resource_sample=True):
         now = time.time() if now is None else float(now)
         metrics = clean_metrics(metrics)
         minute = int(now) // 60 * 60
         changed = {minute: self._minute(node_id, minute)}
-        values = {key: metrics.get(field) for key, field in METRICS.items()}
+        # GPU and RTT collection have their own cadence. Reusing a cached base
+        # resource sample must not suppress those independent observations.
+        values = {key: metrics.get(field) for key, field in METRICS.items()
+                  if field not in NETWORK_RATES and (record_resource_sample or key == 'gpu')}
         values.update({'gpu:' + str(gpu['index']): gpu['util_percent'] for gpu in metrics.get('gpus', [])})
         for key, value in values.items():
             if value is None:
@@ -197,6 +253,27 @@ CREATE TABLE IF NOT EXISTS probe_metadata (
             aggregate['sum'] += value
             aggregate['min'] = min(aggregate['min'], value)
             aggregate['max'] = max(aggregate['max'], value)
+        network_sample = metrics.get('network_sampled_at')
+        if (metrics.get('network_status') == 'ok' and network_sample is not None
+                and now - 35 < network_sample <= now + 60):
+            bucket = int(network_sample) // 60 * 60
+            if bucket not in changed:
+                changed[bucket] = self._minute(node_id, bucket)
+            for key in ('network_rx', 'network_tx'):
+                value = metrics.get(METRICS[key])
+                if value is None:
+                    continue
+                aggregate = changed[bucket]['resources'].setdefault(key, {
+                    'count': 0, 'sum': 0, 'min': value, 'max': value, 'sampled_at': -1})
+                # Persist the latest timestamp in the existing minute JSON, so
+                # cached heartbeats do not multiply a sample even after restart.
+                if network_sample <= aggregate.get('sampled_at', -1):
+                    continue
+                aggregate['count'] += 1
+                aggregate['sum'] += value
+                aggregate['min'] = min(aggregate['min'], value)
+                aggregate['max'] = max(aggregate['max'], value)
+                aggregate['sampled_at'] = network_sample
         samples = list(metrics.get('latency_samples', []))
         previous = latency_sample({'timestamp': metrics.get('latency_sample_at'),
                                    'success': metrics.get('latency_success', metrics.get('latency_ms') is not None),
@@ -263,21 +340,50 @@ CREATE TABLE IF NOT EXISTS probe_metadata (
                             (node_id, json.dumps(value)))
         return dict(value, location_source='manual')
 
-    def enrich(self, node_dict, now=None):
+    def enrich(self, node_dict, now=None, *, manual_location=_UNSET):
         now = time.time() if now is None else float(now)
         node = dict(node_dict)
         for field in PERCENT_FIELDS:
             node.setdefault(field, None)
         node.setdefault('gpus', [])
         node.setdefault('latency_ms', None)
+        for field in NETWORK_RATES:
+            node.setdefault(field, None)
+        node.setdefault('network_status', 'unavailable')
+        node.setdefault('network_interfaces', [])
+        node.setdefault('network_scope', 'unavailable')
+        network_sample = number(node.get('network_sampled_at'))
+        if (network_sample is None or not now - 35 < network_sample <= now + 60
+                or node['network_status'] != 'ok'):
+            node.update(network_rx_bps=None, network_tx_bps=None)
+            if (network_sample is not None and not now - 35 < network_sample <= now + 60
+                    and node['network_status'] in ('ok', 'collecting', 'reset')):
+                node['network_status'] = 'stale'
         seen = number(node.get('last_seen'))
-        age = max(0, now - seen) if seen is not None and seen > 0 else None
-        freshness = 'unknown' if age is None else 'stale' if age >= 35 else 'fresh'
+        heartbeat_age = max(0, now - seen) if seen is not None and seen > 0 else None
+        heartbeat_status = 'unknown' if heartbeat_age is None else 'stale' if heartbeat_age >= 35 else 'fresh'
+        node['heartbeat_freshness'] = {'status': heartbeat_status, 'age_seconds': heartbeat_age,
+                                       'sampled_at': seen if heartbeat_age is not None else None}
+        if 'metrics_status' in node or 'metrics_sampled_at' in node:
+            sampled_at = number(node.get('metrics_sampled_at'))
+            age = max(0, now - sampled_at) if sampled_at is not None else None
+            freshness = 'unknown' if age is None else 'stale'
+            if (node.get('metrics_status') == 'ok' and age is not None and age < 35
+                    and sampled_at <= now + 60):
+                freshness = 'fresh'
+        else:
+            # Legacy agents only report the heartbeat time. Retain their
+            # existing contract until they include actual collection metadata.
+            age, freshness = heartbeat_age, heartbeat_status
+            sampled_at = seen if age is not None else None
         node.update(metrics_age_seconds=age, metrics_stale=freshness != 'fresh', data_freshness=freshness,
-                    freshness={'status': freshness, 'age_seconds': age, 'sampled_at': seen if age is not None else None})
-        row = self.db.execute('SELECT manual_location FROM probe_metadata WHERE node_id=?', (node['id'],)).fetchone()
-        if row and row[0] is not None:
-            node.update(json.loads(row[0]), location_source='manual')
+                    freshness={'status': freshness, 'age_seconds': age, 'sampled_at': sampled_at})
+        if manual_location is _UNSET:
+            row = self.db.execute('SELECT manual_location FROM probe_metadata WHERE node_id=?', (node['id'],)).fetchone()
+            manual_location = row[0] if row else None
+        if manual_location is not None:
+            value = json.loads(manual_location) if isinstance(manual_location, str) else manual_location
+            node.update(value, location_source='manual')
         else:
             value = location(node)
             node.update(value, location_source='node' if any(value.values()) else 'unknown')
@@ -311,9 +417,36 @@ CREATE TABLE IF NOT EXISTS probe_metadata (
         row = self.db.execute('SELECT gpus FROM probe_metadata WHERE node_id=?', (node_id,)).fetchone()
         devices = json.loads(row[0]) if row else []
         return {'node_id': node_id, 'metric': metric, 'range': range, 'device': device,
+                'unit': 'bytes_per_second' if metric in ('network_rx', 'network_tx') else 'percent',
                 'points': [{'timestamp': minute, 'value': values.get(minute)} for minute in builtins_range(start, end + 60, 60)],
                 'stats': {'min': minimum, 'max': maximum, 'avg': total / count if count else None},
                 'gpus': devices, 'devices': devices}
+
+    def cached_latency_summary(self, ids, healthy_ms=100, critical_ms=250, now=None):
+        """Reuse read-only dashboard summaries for at most 15 seconds.
+
+        Heartbeat writes deliberately leave this cache intact. Node-list changes
+        and UTC bucket boundaries always select a fresh summary; generated_at
+        remains the time of the actual calculation, including on cache hits.
+        """
+        if number(healthy_ms) is None or number(critical_ms) is None or critical_ms < healthy_ms:
+            raise ValueError('Invalid latency thresholds')
+        now = time.time() if now is None else float(now)
+        ids = tuple(dict.fromkeys(ids))
+        key = (ids, healthy_ms, critical_ms, int(now) // 900)
+        tick = time.monotonic()
+        cached = self._latency_summary_cache.get(key)
+        if cached is not None:
+            created, summary = cached
+            if 0 <= tick - created < LATENCY_SUMMARY_TTL and summary['generated_at'] <= now:
+                self._latency_summary_cache.move_to_end(key)
+                return summary
+        summary = self.latency_summary(ids, healthy_ms, critical_ms, now)
+        self._latency_summary_cache[key] = (tick, summary)
+        self._latency_summary_cache.move_to_end(key)
+        while len(self._latency_summary_cache) > LATENCY_SUMMARY_CACHE_LIMIT:
+            self._latency_summary_cache.popitem(last=False)
+        return summary
 
     def latency_summary(self, ids, healthy_ms=100, critical_ms=250, now=None):
         if number(healthy_ms) is None or number(critical_ms) is None or critical_ms < healthy_ms:

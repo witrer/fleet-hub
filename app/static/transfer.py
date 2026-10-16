@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["paramiko>=3.4,<5"]
 # ///
-"""Upload files through an frp XTCP direct tunnel. No relay fallback or resume.
+"""Upload through an frp XTCP tunnel or an explicitly selected OneDrive relay.
 
 Run: FLEET_TOKEN=... uv run transfer.py --hub https://hub --node NODE \
      --source ./dataset --destination /data/dataset
@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
+import http.client
 import io
 import json
 import logging
@@ -33,12 +35,329 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 
 import paramiko
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
+RELAY_CHUNK_SIZE = 10 * 1024 * 1024  # A multiple of Graph's 320 KiB requirement.
+RELAY_ATTEMPTS = 5
+
+
+class RelayHTTPError(RuntimeError):
+    def __init__(self, service: str, status: int, retry_after: float = 0):
+        super().__init__(f"{service} returned HTTP {status}")
+        self.status, self.retry_after = status, retry_after
+
+
+class RelayUncertainError(RuntimeError):
+    """The response was lost or unusable; query the server before retrying."""
+
+
+class RelayNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        # Never forward the hub's bearer token or a signed PUT to another host.
+        return None
+
+
+def relay_http(request: urllib.request.Request, service: str, timeout: float = 45) -> tuple[int, dict]:
+    try:
+        with urllib.request.build_opener(RelayNoRedirect()).open(request, timeout=timeout) as response:
+            raw = response.read(8 * 1024 * 1024 + 1)
+            if len(raw) > 8 * 1024 * 1024:
+                raise RelayUncertainError(f"{service} returned an oversized response")
+            try:
+                data = json.loads(raw) if raw else {}
+            except (ValueError, UnicodeDecodeError):
+                raise RelayUncertainError(f"{service} returned invalid JSON") from None
+            if not isinstance(data, dict):
+                raise RelayUncertainError(f"{service} returned an invalid response")
+            return response.status, data
+    except urllib.error.HTTPError as exc:
+        # Graph URLs and response bodies may contain upload capabilities.
+        try:
+            retry_after = min(60, max(0, float(exc.headers.get("Retry-After", "0"))))
+        except (TypeError, ValueError):
+            retry_after = 0
+        exc.close()
+        raise RelayHTTPError(service, exc.code, retry_after) from None
+    except (urllib.error.URLError, OSError, EOFError, http.client.HTTPException):
+        raise RelayUncertainError(f"{service} connection failed; resumable state was retained") from None
+
+
+def relay_api(hub: str, path: str, token: str, payload: dict | None = None) -> dict:
+    request = urllib.request.Request(hub.rstrip("/") + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        method="POST" if payload is not None else "GET")
+    for attempt in range(RELAY_ATTEMPTS):
+        try:
+            return relay_http(request, "Hub")[1]
+        except RelayHTTPError as exc:
+            if exc.status != 429 and exc.status < 500 or attempt == RELAY_ATTEMPTS - 1:
+                raise
+            delay = max(exc.retry_after, min(2 ** attempt, 16))
+        except RelayUncertainError:
+            if attempt == RELAY_ATTEMPTS - 1:
+                raise
+            delay = min(2 ** attempt, 16)
+        time.sleep(delay)
+    raise RuntimeError("Hub retries exhausted")
+
+
+def relay_manifest(files: list, directories: list[str]) -> dict:
+    entries = []
+    for local, relative, size in files:
+        current = local.stat()
+        if local.is_symlink() or not stat.S_ISREG(current.st_mode) or current.st_size != size:
+            raise RuntimeError("Source changed while preparing the relay manifest")
+        entries.append({"path": relative, "size": size, "mtime_ns": current.st_mtime_ns})
+    return {"files": entries, "directories": directories}
+
+
+def relay_cache_path(context: dict) -> Path:
+    default = (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "fleet-hub" / "client"
+               if os.name == "nt" else Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "fleet-hub" / "client")
+    root = Path(os.environ.get("FLEET_CLIENT_HOME", str(default))).expanduser()
+    if root.is_symlink():
+        raise RuntimeError("Client directory must not be a symbolic link")
+    cache = root / "relay-transfers"
+    if cache.is_symlink():
+        raise RuntimeError("Relay cache must not be a symbolic link")
+    cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+    return cache / (key + ".json")
+
+
+@contextlib.contextmanager
+def relay_state_lock(path: Path):
+    lock_path = path.with_suffix(".lock")
+    if lock_path.is_symlink():
+        raise RuntimeError("Relay lock must not be a symbolic link")
+    with lock_path.open("a+b") as handle:
+        if os.name != "nt":
+            import fcntl
+            os.chmod(lock_path, 0o600)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise RuntimeError("Another uploader is using this source and destination") from None
+        else:
+            import msvcrt
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise RuntimeError("Another uploader is using this source and destination") from None
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def save_relay_state(path: Path, state: dict) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=".relay-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(state, output, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def relay_upload_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        valid = (parsed.scheme == "https" or parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"})
+        if not valid or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise RuntimeError("Hub returned an invalid upload URL") from None
+    return value
+
+
+def relay_offset(value, size: int) -> int:
+    if type(value) is not int or value < 0 or value > size or value != size and value % (320 * 1024):
+        raise RuntimeError("OneDrive returned an invalid resume offset")
+    return value
+
+
+def relay_complete(hub: str, prefix: str, token: str, item_id: str | None = None, probe: bool = False) -> bool:
+    try:
+        result = relay_api(hub, prefix + "/complete", token, {"item_id": item_id} if item_id else {})
+    except RelayHTTPError as exc:
+        if probe and exc.status == 409:
+            return False
+        raise
+    if result.get("uploaded") is True:
+        return True
+    if probe and result.get("uploaded") is False:
+        return False
+    raise RuntimeError("Hub did not confirm the OneDrive upload")
+
+
+def upload_relay_file(hub: str, token: str, task_id: str, entry: dict, local: Path, expected: dict) -> None:
+    prefix = "/api/relay/transfers/" + urllib.parse.quote(task_id, safe="") + "/files/" + urllib.parse.quote(str(entry["id"]), safe="")
+    size, expected_mtime = expected["size"], expected["mtime_ns"]
+
+    def check_source(handle=None):
+        current = os.fstat(handle.fileno()) if handle else local.stat()
+        if local.is_symlink() or not stat.S_ISREG(current.st_mode) or (current.st_size, current.st_mtime_ns) != (size, expected_mtime):
+            raise RuntimeError("Source changed; this relay task cannot safely resume")
+
+    check_source()
+    session = relay_api(hub, prefix + "/session", token, {})
+    failures = restarts = 0
+    last_print = time.monotonic()
+    with local.open("rb") as incoming:
+        while True:
+            check_source(incoming)
+            if session.get("uploaded") is True:
+                return
+            offset = relay_offset(session.get("next_offset", 0), size)
+            if offset == size:
+                relay_complete(hub, prefix, token)
+                return
+            upload_url = relay_upload_url(session.get("upload_url"))
+            incoming.seek(offset)
+            chunk = incoming.read(min(RELAY_CHUNK_SIZE, size - offset))
+            check_source(incoming)
+            if len(chunk) != min(RELAY_CHUNK_SIZE, size - offset):
+                raise RuntimeError("Source changed during the relay upload")
+            end = offset + len(chunk)
+            request = urllib.request.Request(upload_url, data=chunk, method="PUT", headers={
+                "Content-Type": "application/octet-stream", "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {offset}-{end - 1}/{size}",
+            })
+            retry_after = 0
+            try:
+                status, result = relay_http(request, "OneDrive", timeout=90)
+            except RelayHTTPError as exc:
+                if exc.status not in {401, 403, 404, 408, 410, 416, 429} and exc.status < 500:
+                    raise
+                retry_after = exc.retry_after
+            except RelayUncertainError:
+                # Reconcile ambiguous replies before sending any bytes again.
+                pass
+            else:
+                if status in (200, 201):
+                    check_source(incoming)
+                    relay_complete(hub, prefix, token, result.get("id") if isinstance(result.get("id"), str) else None)
+                    return
+                if status != 202:
+                    raise RuntimeError("OneDrive returned an unexpected upload response")
+                ranges = result.get("nextExpectedRanges")
+                if not isinstance(ranges, list) or not ranges or not all(isinstance(value, str) and re.fullmatch(r"\d+-\d*", value) for value in ranges):
+                    raise RuntimeError("OneDrive returned invalid upload ranges")
+                next_offset = relay_offset(min(int(value.split("-", 1)[0]) for value in ranges), size)
+                if next_offset <= offset:
+                    raise RuntimeError("OneDrive upload did not advance")
+                session["next_offset"] = next_offset
+                failures = 0
+                if time.monotonic() - last_print >= 5:
+                    print(f"OneDrive upload: {expected['path']} ({next_offset:,}/{size:,} bytes)", flush=True)
+                    last_print = time.monotonic()
+                    progress_request = urllib.request.Request(hub.rstrip("/") + prefix + "/upload-progress",
+                        data=json.dumps({"bytes_done": next_offset}).encode(), method="POST",
+                        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                    try:
+                        # Monitoring has its own small budget and never retries
+                        # inline; a quiet hub must not stall the data path.
+                        relay_http(progress_request, "Hub", timeout=4)
+                    except RuntimeError:
+                        pass
+                continue
+            failures += 1
+            if failures >= RELAY_ATTEMPTS:
+                raise RuntimeError("OneDrive upload retries exhausted; rerun the same command to resume") from None
+            time.sleep(max(retry_after, min(2 ** (failures - 1), 16)))
+            if end == size and relay_complete(hub, prefix, token, probe=True):
+                return
+            renewed = relay_api(hub, prefix + "/session", token, {})
+            if renewed.get("uploaded") is not True and relay_offset(renewed.get("next_offset", 0), size) < offset:
+                restarts += 1
+                if restarts > 3:
+                    raise RuntimeError("OneDrive upload session repeatedly expired; resumable state was retained")
+            session = renewed
+
+
+def upload_onedrive(hub: str, token: str, node: str, source: Path, files: list, directories: list[str], destination: str, overwrite: bool) -> dict:
+    relay_upload_url(hub)  # Refuse credentials in URLs and insecure non-loopback hubs.
+    if len(files) > 10000 or sum(item[2] for item in files) > 10 * 1024 ** 3:
+        raise RuntimeError("OneDrive relay tasks support at most 10,000 files and 10 GiB")
+    manifest = relay_manifest(files, directories)
+    context = {"hub": hub.rstrip("/"), "node": node, "source": str(source), "destination": destination,
+               "overwrite": overwrite, "is_directory": source.is_dir()}
+    state_path = relay_cache_path(context)
+    with relay_state_lock(state_path):
+        state = None
+        if state_path.is_symlink():
+            raise RuntimeError("Relay state must not be a symbolic link")
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict) or state.get("context") != context or not isinstance(state.get("idempotency_key"), str):
+                    raise ValueError
+            except (OSError, ValueError, UnicodeDecodeError):
+                raise RuntimeError("Relay resume state is invalid; it was retained for inspection") from None
+        job = None
+        if state and state.get("id"):
+            job = relay_api(hub, "/api/relay/transfers/" + urllib.parse.quote(str(state["id"]), safe=""), token)
+        terminal = {"completed", "failed", "expired", "cancelled"}
+        if state and state.get("manifest") != manifest:
+            if not job or job.get("status") not in terminal:
+                raise RuntimeError("Source changed; cannot resume the existing active relay task")
+            state = job = None
+        if job and job.get("status") in {"failed", "expired", "cancelled"}:
+            state = job = None
+        if state is None:
+            state = {"version": 1, "context": context, "manifest": manifest, "idempotency_key": uuid.uuid4().hex}
+            # Save the idempotency key before creating the server-side task.
+            save_relay_state(state_path, state)
+        if job is None:
+            job = relay_api(hub, "/api/relay/transfers", token, {
+                "node_id": node, "name": source.name, "destination": destination, "overwrite": overwrite,
+                "is_directory": source.is_dir(), **manifest, "idempotency_key": state["idempotency_key"],
+            })
+            state["id"] = str(job["id"])
+            save_relay_state(state_path, state)
+        task_id = str(job["id"])
+        print(f"OneDrive relay task {task_id}: {len(files)} files. File bytes bypass the hub.", flush=True)
+        if job.get("status") not in {"ready", "downloading", "completed"}:
+            entries = {item["path"]: item for item in job.get("files", [])}
+            if set(entries) != {item[1] for item in files}:
+                raise RuntimeError("Hub relay manifest does not match the local source")
+            expected = {item["path"]: item for item in manifest["files"]}
+            for local, relative, size in files:
+                entry = entries[relative]
+                if entry.get("size") != size:
+                    raise RuntimeError("Hub relay file size does not match the local source")
+                upload_relay_file(hub, token, task_id, entry, local, expected[relative])
+                print(f"Stored in OneDrive: {relative} ({size:,} bytes)", flush=True)
+            current_files, current_directories, _ = collect_files(source)
+            if relay_manifest(current_files, current_directories) != manifest:
+                raise RuntimeError("Source changed during upload; task was not released to the receiver")
+            job = relay_api(hub, "/api/relay/transfers/" + urllib.parse.quote(task_id, safe="") + "/ready", token, {})
+            if job.get("status") not in {"ready", "downloading", "completed"}:
+                raise RuntimeError("Hub did not release the relay task to the receiver; resume state was retained")
+        print(f"Relay status: {job.get('status', 'unknown')}. " +
+              ("The hub reports that the receiver completed this task." if job.get("status") == "completed" else
+               "Files are stored in OneDrive; receiver delivery is pending or in progress."), flush=True)
+        print("Authenticated status endpoint: " + hub.rstrip("/") + "/api/relay/transfers/" + urllib.parse.quote(task_id, safe=""), flush=True)
+        return job
 
 
 def api(hub: str, path: str, token: str, payload: dict, timeout: float = 15) -> dict:
@@ -92,6 +411,14 @@ def collect_files(source: Path) -> tuple[list[tuple[Path, str, int]], list[str],
     return files, directories, sum(entry[2] for entry in files)
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def frpc_binary(job: dict, system: str) -> Path:
     version = str(job["frp_version"]).removeprefix("v")
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
@@ -105,7 +432,7 @@ def frpc_binary(job: dict, system: str) -> Path:
     binary = cache / filename
     marker = cache / "binary.sha256"
     if binary.is_file() and marker.is_file():
-        if hashlib.sha256(binary.read_bytes()).hexdigest() == marker.read_text().strip():
+        if file_sha256(binary) == marker.read_text().strip():
             return binary
     cache.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="download-", dir=cache) as scratch:
@@ -133,7 +460,7 @@ def frpc_binary(job: dict, system: str) -> Path:
                 with package.extractfile(matches[0]) as source, extracted.open("wb") as output:
                     shutil.copyfileobj(source, output)
             extracted.chmod(0o700)
-        digest_text = hashlib.sha256(extracted.read_bytes()).hexdigest()
+        digest_text = file_sha256(extracted)
         os.replace(extracted, binary)
         marker.write_text(digest_text, encoding="ascii")
     return binary
@@ -233,36 +560,92 @@ def host_key(value: str) -> paramiko.PKey:
     return paramiko.PKey.from_type_string(key_type, base64.b64decode(key_data, validate=True))
 
 
+def log_tail(path: Path, limit: int = 16000) -> str:
+    with path.open("rb") as source:
+        source.seek(0, os.SEEK_END)
+        source.seek(max(0, source.tell() - limit))
+        return source.read(limit).decode(errors="replace")
+
+
+def close_connection(connection: socket.socket) -> None:
+    # shutdown wakes Paramiko even when it is waiting in a different thread.
+    try:
+        connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    connection.close()
+
+
 def connect_direct(job: dict, key: paramiko.PKey, port: int, process: subprocess.Popen, log_path: Path, connect_timeout: int = 180) -> paramiko.SSHClient:
     pinned_key = host_key(job["ssh_host_key"])
     deadline = time.monotonic() + connect_timeout
     last_error = "direct tunnel is not ready"
+    reached_ssh = False
     while time.monotonic() < deadline:
-        if process.poll() is not None:
-            log = log_path.read_text(errors="replace")[-1800:]
-            raise RuntimeError("frpc exited: " + log)
+        exit_code = process.poll()
+        if exit_code is not None:
+            # Raw FRP logs can contain credentials; main saves a redacted tail.
+            raise RuntimeError(f"frpc exited before direct SSH was ready (exit code {exit_code}); see FRP diagnostics")
         client = paramiko.SSHClient()
         client.get_host_keys().add(f"[127.0.0.1]:{port}", pinned_key.get_name(), pinned_key)
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        connection = watchdog = None
+        connected = False
         try:
-            remaining = max(0.1, deadline - time.monotonic())
-            client.connect("127.0.0.1", port=port, username=job["ssh_user"], pkey=key,
-                           timeout=min(5, remaining), banner_timeout=min(15, remaining), auth_timeout=min(15, remaining),
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            connection = socket.create_connection(("127.0.0.1", port), timeout=min(5, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Paramiko's timeout also bounds SSH negotiation. FRP v0.71.1's
+            # openTunnel waits up to 20s, so a 5s negotiation limit abandons live
+            # XTCP attempts prematurely. Keep one socket through that window.
+            # https://github.com/fatedier/frp/blob/d8cf1800dc1abd7fda1828cab105d7a6b5a50eb1/client/visitor/xtcp.go#L202
+            # A socket watchdog bounds negotiation + authentication together;
+            # independent phase timeouts alone can overrun the total budget.
+            watchdog = threading.Timer(remaining, close_connection, args=(connection,))
+            watchdog.daemon = True
+            watchdog.start()
+            client.connect("127.0.0.1", port=port, username=job["ssh_user"], pkey=key, sock=connection,
+                           timeout=min(30, remaining), banner_timeout=min(30, remaining), auth_timeout=min(15, remaining),
+                           channel_timeout=60,
                            allow_agent=False, look_for_keys=False)
+            watchdog.cancel()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("SSH negotiation/authentication exceeded the total connection budget")
             client.get_transport().set_keepalive(10)
+            connected = True
             return client
         except paramiko.AuthenticationException as exc:
-            client.close()
-            raise RuntimeError("Direct tunnel reached SSH, but SSH authentication failed: " + str(exc)) from exc
+            if time.monotonic() < deadline:
+                raise RuntimeError("Direct tunnel reached SSH, but SSH authentication failed: " + str(exc)) from exc
+            last_error = "SSH authentication did not finish within the total connection budget"
         except paramiko.BadHostKeyException as exc:
-            client.close()
             raise RuntimeError("Direct tunnel reached SSH, but the SSH host key did not match") from exc
         except (OSError, EOFError, paramiko.SSHException) as exc:
             last_error = str(exc)
-            client.close()
-            time.sleep(0.3)
-    log = log_path.read_text(errors="replace")
-    stage = "SSH handshake over the direct tunnel" if "establishing nat hole connection successful" in log else "P2P UDP hole punching"
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+            if not connected:
+                transport = client.get_transport()
+                reached_ssh = reached_ssh or bool(getattr(transport, "remote_version", ""))
+                client.close()
+                if connection is not None:
+                    connection.close()
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.3, remaining))
+    log = log_tail(log_path)
+    if reached_ssh:
+        stage = "SSH handshake/authentication over the direct tunnel"
+    elif "establishing nat hole connection successful" in log:
+        # FRP emits that line before QUIC/KCP session.Init, not after SSH.
+        stage = "P2P tunnel session establishment (UDP hole punching was reported successful; SSH not confirmed)"
+    else:
+        stage = "P2P UDP hole punching"
     raise RuntimeError(f"Timed out after {connect_timeout} seconds waiting for {stage}; no relay fallback was used. " + last_error)
 
 
@@ -357,6 +740,7 @@ def main() -> int:
     parser.add_argument("--destination", required=True, help="Remote POSIX path; directory sources are copied into this path")
     parser.add_argument("--connect-timeout", type=int, default=180, help="Seconds to allow P2P/SSH connection attempts (default: 180)")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--transport", choices=("p2p", "onedrive"), default="p2p", help="Explicit transport selection; no automatic fallback (default: p2p)")
     args = parser.parse_args()
     if args.connect_timeout <= 0:
         parser.error("--connect-timeout must be a positive number of seconds")
@@ -369,6 +753,9 @@ def main() -> int:
     try:
         source = args.source.expanduser().absolute()
         files, directories, total = collect_files(source)
+        if args.transport == "onedrive":
+            upload_onedrive(args.hub, token, args.node, source, files, directories, args.destination, args.overwrite)
+            return 0
         system = platform_name()
         generated = Ed25519PrivateKey.generate()
         public_key = generated.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).decode()
@@ -412,7 +799,7 @@ def main() -> int:
                             process.kill()
                             process.wait(timeout=5)
                     log.flush()
-                    details = log_path.read_text(errors="replace")[-16000:]
+                    details = log_tail(log_path)
                     for credential in (token, job["token"], *re.findall(r'(?m)^\s*secretKey\s*=\s*"([^"]+)"', job["frpc_config"])):
                         details = details.replace(credential, "[REDACTED]")
                     saved_logs = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".cache"))) / "fleet-hub" / "transfer-logs"

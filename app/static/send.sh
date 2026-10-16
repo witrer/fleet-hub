@@ -10,21 +10,23 @@ node=''
 source_path=''
 destination=''
 connect_timeout=180
+transport=p2p
 overwrite=()
 
 fail() { printf 'Fleet: %s\n' "$*" >&2; exit 1; }
 usage() {
-    printf '%s\n' '用法: --node 节点ID --source 本地路径 --destination 远端路径 [--connect-timeout 秒数] [--overwrite]'
+    printf '%s\n' '用法: --node 节点ID --source 本地路径 --destination 远端路径 [--transport p2p|onedrive] [--connect-timeout 秒数] [--overwrite]'
 }
 while (($#)); do
     case "$1" in
-        --node|--source|--destination|--connect-timeout)
+        --node|--source|--destination|--connect-timeout|--transport)
             (($# >= 2)) || fail "$1 缺少参数"
             case "$1" in
                 --node) node=$2 ;;
                 --source) source_path=$2 ;;
                 --destination) destination=$2 ;;
                 --connect-timeout) connect_timeout=$2 ;;
+                --transport) transport=$2 ;;
             esac
             shift 2 ;;
         --overwrite) overwrite=(--overwrite); shift ;;
@@ -34,6 +36,7 @@ while (($#)); do
 done
 [[ -n "$node" && -n "$source_path" && -n "$destination" ]] || { usage >&2; exit 2; }
 [[ "$connect_timeout" =~ ^[1-9][0-9]*$ ]] || fail '--connect-timeout 必须为正整数秒数'
+[[ "$transport" == p2p || "$transport" == onedrive ]] || fail '--transport 必须为 p2p 或 onedrive'
 [[ -e "$source_path" ]] || fail "本地路径不存在: $source_path"
 case "$hub" in https://*|http://127.0.0.1:*|http://localhost:*) ;; *) fail '启动脚本缺少有效中枢地址' ;; esac
 for program in curl tar; do command -v "$program" >/dev/null || fail "系统缺少 $program"; done
@@ -67,6 +70,7 @@ client_root=${FLEET_CLIENT_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/fleet-hub/
 mkdir -p "$client_root"
 chmod 700 "$client_root"
 client_root=$(cd "$client_root" && pwd -P)
+export FLEET_CLIENT_HOME="$client_root"
 hub_id=$(printf '%s' "$hub" | hash_stream)
 config_dir="$client_root/hubs/$hub_id"
 mkdir -p "$config_dir" "$client_root/bin"
@@ -101,8 +105,8 @@ if [[ ! -x "$uv_bin" || ! -f "$uv_hash" || "$(hash_file "$uv_bin")" != "$(cat "$
     original="uv-$target.tar.gz"
     mirror="https://gh-proxy.org/https://github.com/astral-sh/uv/releases/download/$uv_version/$original"
     fallback="$hub/downloads/uv-$uv_version-$target.tar.gz"
-    if ! curl -fsSL --connect-timeout 15 --max-time 300 --retry 1 "$mirror" -o "$scratch/uv.tar.gz"; then
-        curl -fsSL --connect-timeout 15 --max-time 300 --retry 1 "$fallback" -o "$scratch/uv.tar.gz" || fail '上传组件下载失败，请稍后重试'
+    if ! curl -fsSL --connect-timeout 15 --max-time 300 --speed-time 30 --speed-limit 1 "$mirror" -o "$scratch/uv.tar.gz"; then
+        curl -fsSL --connect-timeout 15 --max-time 300 --speed-time 30 --speed-limit 1 --retry 1 "$fallback" -o "$scratch/uv.tar.gz" || fail '上传组件下载失败，请稍后重试'
     fi
     [[ "$(hash_file "$scratch/uv.tar.gz")" == "$archive_hash" ]] || fail '上传组件校验失败，已停止执行'
     tar -xzf "$scratch/uv.tar.gz" -C "$scratch" "uv-$target/uv"
@@ -112,8 +116,20 @@ if [[ ! -x "$uv_bin" || ! -f "$uv_hash" || "$(hash_file "$uv_bin")" != "$(cat "$
     chmod 600 "$uv_hash"
 fi
 
-curl -fsSL --connect-timeout 15 --max-time 60 --retry 1 "$hub/transfer.py" -o "$scratch/transfer.py" || fail '无法获取中枢上传组件'
-mv -f "$scratch/transfer.py" "$config_dir/transfer.py"
+script_headers=()
+if [[ -s "$config_dir/transfer.py" && ! -L "$config_dir/transfer.py" ]]; then
+    # Hash only this small script to bind the validator to the actual cached bytes.
+    # No sidecar can get out of sync when concurrent launches update the cache.
+    script_headers=(-H "If-None-Match: \"$(hash_file "$config_dir/transfer.py")\"")
+fi
+http_status=$(curl -fsSL --connect-timeout 15 --max-time 60 --retry 1 "${script_headers[@]}" \
+    -w '%{http_code}' "$hub/transfer.py" -o "$scratch/transfer.py") || fail '无法获取中枢上传组件'
+case "$http_status" in
+    200) [[ -s "$scratch/transfer.py" ]] || fail '中枢返回了空上传组件'
+         mv -f "$scratch/transfer.py" "$config_dir/transfer.py" ;;
+    304) [[ -s "$config_dir/transfer.py" && ! -L "$config_dir/transfer.py" ]] || fail '本地上传组件缓存不可用，请重试' ;;
+    *) fail "中枢上传组件响应异常: $http_status" ;;
+esac
 chmod 600 "$config_dir/transfer.py"
 export UV_CACHE_DIR="$client_root/cache"
 export UV_PYTHON_INSTALL_DIR="$client_root/python"
@@ -124,4 +140,4 @@ export UV_PYTHON_INSTALL_MIRROR='https://gh-proxy.org/https://github.com/astral-
 export PYTHONUTF8=1
 printf '%s\n' '正在连接目标服务器并上传；运行环境和依赖会自动准备。'
 "$uv_bin" run --no-config --no-project --managed-python --python 3.12 --script "$config_dir/transfer.py" \
-    --hub "$hub" --node "$node" --source "$source_path" --destination "$destination" --connect-timeout "$connect_timeout" "${overwrite[@]}"
+    --hub "$hub" --node "$node" --source "$source_path" --destination "$destination" --connect-timeout "$connect_timeout" --transport "$transport" "${overwrite[@]}"

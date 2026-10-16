@@ -7,12 +7,23 @@ TOKEN="${1:-}"
 export FLEET_NODE_DIR="$ROOT"
 mkdir -p "$ROOT/runtime"
 usable_python() { "$1" -c 'import sys,ssl,urllib.request; assert sys.version_info >= (3,8)' >/dev/null 2>&1; }
+# Keep a previous user-space installation usable even when it is not on PATH.
+# Explicit FLEET_PYTHON and system interpreters retain their existing priority.
 PYTHON=''
-for candidate in "${FLEET_PYTHON:-python3}" python3 python; do
+for candidate in "${FLEET_PYTHON:-python3}" python3 python "$ROOT"/runtime/python/*/bin/python3; do
   if command -v "$candidate" >/dev/null 2>&1 && usable_python "$candidate"; then
     PYTHON=$(command -v "$candidate"); break
   fi
 done
+# A slow but progressing download may continue; a dead mirror cannot stall a
+# deployment indefinitely before the existing hub fallback gets a turn.
+download() {
+  curl -fSL --connect-timeout 10 --speed-limit 1 --speed-time 30 \
+    --retry 1 --retry-delay 1 --retry-max-time 60 "$1" -o "$2"
+}
+TMP=''
+UV_ARCHIVE=''
+trap 'rm -f -- "${TMP:-}" "${UV_ARCHIVE:-}"' EXIT
 if [ -z "$PYTHON" ] && [ "$(id -u)" = 0 ]; then
   echo '正在自动安装运行环境…'
   if command -v apt-get >/dev/null 2>&1; then
@@ -36,8 +47,8 @@ if [ -z "$PYTHON" ]; then
   echo '正在自动准备用户运行环境…'
   if [ ! -x "$ROOT/runtime/uv" ]; then
     UV_ARCHIVE=$(mktemp "$ROOT/runtime/uv.XXXXXX")
-    curl -fSL --connect-timeout 15 --max-time 120 --retry 2 "https://gh-proxy.org/https://github.com/astral-sh/uv/releases/download/0.13.1/uv-${UV_ARCH}-unknown-linux-musl.tar.gz" -o "$UV_ARCHIVE" || \
-      curl -fSL --retry 3 "$HUB/downloads/uv-0.13.1-${UV_ARCH}-unknown-linux-musl.tar.gz" -o "$UV_ARCHIVE"
+    download "https://gh-proxy.org/https://github.com/astral-sh/uv/releases/download/0.13.1/uv-${UV_ARCH}-unknown-linux-musl.tar.gz" "$UV_ARCHIVE" || \
+      download "$HUB/downloads/uv-0.13.1-${UV_ARCH}-unknown-linux-musl.tar.gz" "$UV_ARCHIVE"
     echo "$UV_SHA  $UV_ARCHIVE" | sha256sum -c -
     tar -xzf "$UV_ARCHIVE" -C "$ROOT/runtime" --strip-components=1 "uv-${UV_ARCH}-unknown-linux-musl/uv"
     rm -f "$UV_ARCHIVE"
@@ -48,15 +59,29 @@ if [ -z "$PYTHON" ]; then
   PYTHON=$("$ROOT/runtime/uv" python find --managed-python 3.12)
 fi
 TMP=$(mktemp "$ROOT/node-install.XXXXXX.py")
-trap 'rm -f "$TMP"' EXIT
-curl -fsSL --retry 3 "$HUB/node.py" -o "$TMP"
-"$PYTHON" - "$HUB" "$TMP" <<'PY'
+for attempt in 1 2; do
+  download "$HUB/node.py" "$TMP"
+  if "$PYTHON" - "$HUB" "$TMP" <<'PY'
 import hashlib,json,pathlib,sys,urllib.request
 with urllib.request.urlopen(sys.argv[1]+'/api/agent-release',timeout=30) as response:
     release=json.load(response)
 source=pathlib.Path(sys.argv[2]).read_bytes()
 if hashlib.sha256(source).hexdigest()!=release['sha256']:
-    raise SystemExit('节点程序下载校验失败，请重新执行安装命令')
+    raise SystemExit(75)
 compile(source, 'node.py', 'exec')
 PY
+  then
+    break
+  else
+    verify_status=$?
+    # Only a checksum mismatch can be a publication race. Network, manifest
+    # and compile failures keep their original diagnostics and are not retried.
+    if [ "$verify_status" != 75 ]; then exit "$verify_status"; fi
+    if [ "$attempt" = 2 ]; then
+      echo '节点程序下载校验失败，请稍后重新执行安装命令' >&2
+      exit "$verify_status"
+    fi
+    echo '节点程序校验不一致，正在重新下载并校验…' >&2
+  fi
+done
 "$PYTHON" "$TMP" install --hub "$HUB" --token="$TOKEN"

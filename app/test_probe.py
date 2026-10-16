@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import sqlite3
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('probe_next', Path(__file__).with_name('probe.py'))
 probe = importlib.util.module_from_spec(spec)
@@ -50,6 +51,158 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(history['stats']['min'], 10)
         self.assertEqual(history['stats']['max'], 90)
         self.assertAlmostEqual(history['stats']['avg'], 130 / 3)
+
+    def test_network_values_preserve_units_and_reject_invalid_optional_fields(self):
+        clean = self.store.clean_metrics({'network_status': 'ok', 'network_rx_bps': 123456.75,
+            'network_tx_bps': None, 'network_rx': 9000000, 'network_tx_errors': 4,
+            'network_rx_dropped': 5, 'network_interfaces': ['eth0', 'eth0', '../bad', 1, 'wg0'],
+            'network_scope': 'default_route', 'network_counter_scope': 'interface_lifetime',
+            'network_sampled_at': NOW, 'network_interval_seconds': 10})
+        self.assertEqual(clean['network_rx_bps'], 123456.75)
+        self.assertIsNone(clean['network_tx_bps'])
+        self.assertEqual(clean['network_rx'], 9000000)
+        self.assertEqual(clean['network_interfaces'], ['eth0', 'wg0'])
+        self.assertEqual(clean['network_tx_errors'], 4)
+        self.assertEqual(clean['network_rx_dropped'], 5)
+        self.assertNotIn('network_rx_bps', self.store.clean_metrics({'network_rx': 100}))
+        for invalid in (True, -1, float('nan'), float('inf'), 10 ** 1000, '50'):
+            with self.subTest(value=invalid):
+                self.assertIsNone(self.store.clean_metrics({'network_rx_bps': invalid})['network_rx_bps'])
+
+    def test_network_history_uses_its_timestamp_and_deduplicates_after_restart(self):
+        sampled = NOW // 60 * 60 - 2
+        data = {'metrics_status': 'error', 'network_status': 'ok', 'network_sampled_at': sampled,
+                'network_rx_bps': 200000, 'network_tx_bps': 0}
+        self.store.record('n', data, NOW, record_resource_sample=False)
+        reopened = probe.ProbeStore(self.db)
+        reopened.record('n', data, NOW + 1, record_resource_sample=False)
+        updated = dict(data, network_sampled_at=sampled + 1, network_rx_bps=400000, network_tx_bps=None)
+        reopened.record('n', updated, NOW + 2, record_resource_sample=False)
+        # Replaying an earlier cached sample cannot change an aggregate either.
+        reopened.record('n', data, NOW + 3, record_resource_sample=False)
+        history = reopened.history('n', 'network_rx', now=NOW + 3)
+        self.assertEqual(history['unit'], 'bytes_per_second')
+        self.assertEqual(history['points'][-2]['value'], 300000)
+        self.assertIsNone(history['points'][-1]['value'])
+        self.assertEqual(history['stats'], {'min': 200000, 'max': 400000, 'avg': 300000})
+        tx = reopened.history('n', 'network_tx', now=NOW + 3)
+        self.assertEqual(tx['stats']['avg'], 0)
+        resource = json.loads(self.db.execute('SELECT resources FROM probe_minutes WHERE node_id=? AND minute=?',
+                                              ('n', int(sampled) // 60 * 60)).fetchone()[0])
+        self.assertEqual(resource['network_rx']['count'], 2)
+        self.assertEqual(resource['network_tx']['count'], 1)
+        self.assertEqual(reopened.history('n', 'cpu', now=NOW)['unit'], 'percent')
+        with self.assertRaises(ValueError):
+            reopened.history('n', 'network_rx', device=0, now=NOW)
+
+    def test_unknown_reset_and_stale_network_samples_do_not_record_zero_or_rate(self):
+        for status in ('collecting', 'reset', 'unavailable', 'error', 'stale'):
+            with self.subTest(status=status):
+                data = {'network_status': status, 'network_sampled_at': NOW, 'network_rx_bps': 1000}
+                self.assertIsNone(self.store.clean_metrics(data)['network_rx_bps'])
+                self.store.record(status, data, NOW)
+                self.assertIsNone(self.store.history(status, 'network_rx', now=NOW)['stats']['avg'])
+        for timestamp in (NOW - 35, NOW + 61, None):
+            with self.subTest(timestamp=timestamp):
+                self.store.record('old', {'network_status': 'ok', 'network_sampled_at': timestamp,
+                                          'network_rx_bps': 1000}, NOW)
+        self.assertIsNone(self.store.history('old', 'network_rx', now=NOW)['stats']['avg'])
+
+    def test_network_freshness_is_independent_of_heartbeat_and_basic_metrics(self):
+        fresh = self.store.enrich({'id': 'n', 'last_seen': NOW, 'metrics_status': 'error',
+            'network_status': 'ok', 'network_sampled_at': NOW - 1, 'network_rx_bps': 1024,
+            'network_tx_bps': 2048, 'network_rx': 99999}, NOW)
+        self.assertEqual(fresh['network_rx_bps'], 1024)
+        stale = self.store.enrich(dict(fresh, network_sampled_at=NOW - 35), NOW)
+        self.assertEqual(stale['network_status'], 'stale')
+        self.assertIsNone(stale['network_rx_bps'])
+        self.assertEqual(stale['network_rx'], 99999)
+        reset = self.store.enrich(dict(fresh, network_status='reset'), NOW)
+        self.assertIsNone(reset['network_tx_bps'])
+
+    def test_collection_metadata_validation_preserves_absence_and_nulls(self):
+        self.assertNotIn('metrics_status', self.store.clean_metrics({'cpu_percent': 10}))
+        for status in ('collecting', 'ok', 'stale', 'error'):
+            with self.subTest(status=status):
+                clean = self.store.clean_metrics({'metrics_status': status, 'metrics_sampled_at': NOW,
+                                                  'metrics_error': None})
+                self.assertEqual(clean, {'metrics_status': status, 'metrics_sampled_at': NOW,
+                                        'metrics_error': None})
+        for value in (None, True, [], 'unsupported', 10):
+            with self.subTest(status=value):
+                self.assertEqual(self.store.clean_metrics({'metrics_status': value})['metrics_status'], 'error')
+        for value in (None, True, -1, float('nan'), float('inf'), 10**1000, '1700010321'):
+            with self.subTest(timestamp=value):
+                self.assertIsNone(self.store.clean_metrics({'metrics_sampled_at': value})['metrics_sampled_at'])
+        self.assertEqual(self.store.clean_metrics({'metrics_sampled_at': 0})['metrics_sampled_at'], 0)
+        self.assertEqual(len(self.store.clean_metrics({'metrics_error': 'e' * 300})['metrics_error']), 240)
+        self.assertIsNone(self.store.clean_metrics({'metrics_error': {'message': 'bad'}})['metrics_error'])
+
+    def test_resource_freshness_uses_actual_sampling_not_recent_heartbeat(self):
+        for status, stamp, expected, age in (
+                ('ok', NOW - 2, 'fresh', 2),
+                ('ok', NOW - 35, 'stale', 35),
+                ('stale', NOW - 1, 'stale', 1),
+                ('collecting', None, 'unknown', None),
+                ('error', None, 'unknown', None),
+                ('error', NOW - 1, 'stale', 1),
+                ('ok', None, 'unknown', None),
+                ('ok', NOW + 60, 'fresh', 0),
+                ('ok', NOW + 61, 'stale', 0)):
+            with self.subTest(status=status, stamp=stamp):
+                node = self.store.enrich({'id': 'n', 'last_seen': NOW, 'metrics_status': status,
+                                          'metrics_sampled_at': stamp}, NOW)
+                self.assertEqual(node['freshness'], {'status': expected, 'age_seconds': age, 'sampled_at': stamp})
+                self.assertEqual(node['metrics_stale'], expected != 'fresh')
+                self.assertEqual(node['metrics_age_seconds'], age)
+                self.assertEqual(node['data_freshness'], expected)
+                self.assertEqual(node['heartbeat_freshness'], {'status': 'fresh', 'age_seconds': 0,
+                                                               'sampled_at': NOW})
+        # Partial new metadata must not fall back to treating a heartbeat as a
+        # successful resource observation; old agents keep the old contract.
+        partial = self.store.enrich({'id': 'n', 'last_seen': NOW, 'metrics_status': 'collecting'}, NOW)
+        self.assertEqual(partial['freshness']['status'], 'unknown')
+        partial = self.store.enrich({'id': 'n', 'last_seen': NOW, 'metrics_sampled_at': NOW}, NOW)
+        self.assertEqual(partial['freshness']['status'], 'stale')
+        legacy = self.store.enrich({'id': 'n', 'last_seen': NOW - 3}, NOW)
+        self.assertEqual(legacy['freshness'], legacy['heartbeat_freshness'])
+        self.assertEqual(legacy['metrics_age_seconds'], 3)
+
+    def test_repeat_resource_sample_keeps_independent_gpu_and_rtt_history(self):
+        metrics = {'cpu_percent': 10, 'memory_percent': 20, 'disk_percent': 30,
+                   'metrics_status': 'ok', 'metrics_sampled_at': NOW - 2,
+                   'gpus': [{'index': 0, 'util_percent': 20}],
+                   'latency_ms': 10, 'latency_sample_at': NOW - 1}
+        self.store.record('n', metrics, NOW)
+        metrics.update(gpus=[{'index': 0, 'util_percent': 80}], latency_ms=30, latency_sample_at=NOW)
+        self.store.record('n', metrics, NOW + 1, record_resource_sample=False)
+        resources = json.loads(self.db.execute('SELECT resources FROM probe_minutes WHERE node_id=? AND minute=?',
+                                                ('n', NOW // 60 * 60)).fetchone()[0])
+        for metric, value in (('cpu', 10), ('memory', 20), ('disk', 30)):
+            self.assertEqual(resources[metric], {'count': 1, 'sum': value, 'min': value, 'max': value})
+        self.assertEqual(resources['gpu']['count'], 2)
+        self.assertEqual(resources['gpu:0']['count'], 2)
+        self.assertEqual(self.store.history('n', 'gpu', now=NOW + 1)['stats']['avg'], 50)
+        summary = self.store.latency_summary(['n'], now=NOW + 1)['nodes']['n']
+        self.assertEqual(sum(bucket['sample_count'] for bucket in summary['buckets']), 2)
+        self.assertEqual(summary['avg_ms'], 20)
+
+    def test_prefetched_location_avoids_per_node_metadata_queries(self):
+        self.store.set_location('n', {'country_code': 'JP', 'city': 'Tokyo'})
+        statements = []
+        self.db.set_trace_callback(statements.append)
+        overridden = self.store.enrich({'id': 'n', 'country_code': 'US'}, NOW,
+                                       manual_location=json.dumps({'country_code': 'CN', 'city': 'Shanghai'}))
+        direct = self.store.enrich({'id': 'n'}, NOW, manual_location={'country_code': 'KR', 'city': 'Seoul'})
+        no_override = self.store.enrich({'id': 'n', 'country_code': 'US'}, NOW, manual_location=None)
+        self.db.set_trace_callback(None)
+        self.assertEqual(statements, [])
+        self.assertEqual(overridden['country_code'], 'CN')
+        self.assertEqual(overridden['location_source'], 'manual')
+        self.assertEqual(direct['country_code'], 'KR')
+        self.assertEqual(no_override['country_code'], 'US')
+        self.assertEqual(no_override['location_source'], 'node')
+        self.assertEqual(self.store.enrich({'id': 'n'}, NOW)['country_code'], 'JP')
 
     def test_exact_p95_dedup_and_strict_utc_buckets(self):
         start = NOW // 60 * 60 - 60
@@ -151,6 +304,84 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(len([query for query in statements if query.startswith('SELECT')]), 1)
         self.assertEqual(result['nodes']['n']['avg_ms'], 40)
         self.assertEqual(result['nodes']['n']['buckets'][-1]['sample_count'], 1)
+
+    def test_cached_summary_avoids_repeat_queries_and_preserves_generation_time(self):
+        self.store.record('n', {'latency_ms': 40, 'latency_sample_at': NOW - 1}, NOW)
+        statements = []
+        self.db.set_trace_callback(statements.append)
+        with mock.patch.object(probe.time, 'monotonic', return_value=100):
+            first = self.store.cached_latency_summary(['n'], now=NOW)
+        self.store.record('n', {'latency_ms': 200, 'latency_sample_at': NOW + 1}, NOW + 1)
+        with mock.patch.object(probe.time, 'monotonic', return_value=114):
+            cached = self.store.cached_latency_summary(['n', 'n'], now=NOW + 14)
+        self.db.set_trace_callback(None)
+        self.assertIs(cached, first)
+        self.assertEqual(cached['generated_at'], NOW)
+        summary_queries = [query for query in statements if query.startswith('SELECT node_id,minute,latencies')]
+        self.assertEqual(len(summary_queries), 1)
+        self.assertEqual(cached['nodes']['n']['avg_ms'], 40)
+        self.assertEqual(self.store.latency_summary(['n'], now=NOW + 14)['nodes']['n']['avg_ms'], 120)
+
+    def test_cached_summary_expires_on_monotonic_deadline(self):
+        with mock.patch.object(probe.time, 'monotonic', return_value=100):
+            first = self.store.cached_latency_summary(['n'], now=NOW)
+        self.store.record('n', {'latency_ms': 40, 'latency_sample_at': NOW + 1}, NOW + 1)
+        # TTL still expires even if the wall clock has barely moved.
+        with mock.patch.object(probe.time, 'monotonic', return_value=115):
+            refreshed = self.store.cached_latency_summary(['n'], now=NOW + 1)
+        self.assertIsNot(refreshed, first)
+        self.assertEqual(refreshed['generated_at'], NOW + 1)
+        self.assertEqual(refreshed['nodes']['n']['avg_ms'], 40)
+
+    def test_cached_summary_separates_thresholds_and_rejects_invalid_aliases(self):
+        self.store.record('n', {'latency_ms': 150, 'latency_sample_at': NOW - 1}, NOW)
+        with mock.patch.object(probe.time, 'monotonic', return_value=100):
+            normal = self.store.cached_latency_summary(['n'], now=NOW)
+            custom = self.store.cached_latency_summary(['n'], healthy_ms=200, now=NOW)
+            self.store.cached_latency_summary(['n'], healthy_ms=1, critical_ms=250, now=NOW)
+            for healthy, critical in [(True, 250), (0, False), (250, 100), ('1', 250),
+                                      (float('nan'), 250), (100, float('inf'))]:
+                with self.subTest(healthy=healthy, critical=critical), self.assertRaises(ValueError):
+                    self.store.cached_latency_summary(['n'], healthy_ms=healthy, critical_ms=critical, now=NOW)
+        self.assertEqual(normal['nodes']['n']['buckets'][-1]['status'], 'degraded')
+        self.assertEqual(custom['nodes']['n']['buckets'][-1]['status'], 'healthy')
+
+    def test_cached_summary_immediately_excludes_revoked_nodes(self):
+        with mock.patch.object(probe.time, 'monotonic', return_value=100):
+            original = self.store.cached_latency_summary(['n', 'revoked'], now=NOW)
+            current = self.store.cached_latency_summary(['n'], now=NOW + 1)
+            empty = self.store.cached_latency_summary([], now=NOW + 2)
+        self.assertEqual(set(original['nodes']), {'n', 'revoked'})
+        self.assertEqual(set(current['nodes']), {'n'})
+        self.assertEqual(current['generated_at'], NOW + 1)
+        self.assertEqual(empty['nodes'], {})
+
+    def test_cached_summary_refreshes_at_utc_bucket_boundary(self):
+        boundary = NOW // 900 * 900 + 900
+        with mock.patch.object(probe.time, 'monotonic', return_value=100):
+            before = self.store.cached_latency_summary(['n'], now=boundary - 1)
+            after = self.store.cached_latency_summary(['n'], now=boundary)
+        self.assertEqual(after['generated_at'], boundary)
+        self.assertEqual(after['nodes']['n']['buckets'][-1]['start'], boundary)
+        self.assertEqual(before['nodes']['n']['buckets'][-1]['end'], boundary)
+
+    def test_cached_summary_never_returns_future_generation_after_clock_rollback(self):
+        with mock.patch.object(probe.time, 'monotonic', return_value=100):
+            later = self.store.cached_latency_summary(['n'], now=NOW)
+            earlier = self.store.cached_latency_summary(['n'], now=NOW - 1)
+        self.assertIsNot(later, earlier)
+        self.assertEqual(earlier['generated_at'], NOW - 1)
+
+    def test_cached_summary_bounds_memory_and_evicts_least_recently_used(self):
+        with mock.patch.object(probe.time, 'monotonic', return_value=100):
+            originals = [self.store.cached_latency_summary(['n'], healthy_ms=value, now=NOW)
+                         for value in range(4)]
+            self.assertIs(self.store.cached_latency_summary(['n'], healthy_ms=0, now=NOW), originals[0])
+            self.store.cached_latency_summary(['n'], healthy_ms=4, now=NOW)
+            self.assertEqual(len(self.store._latency_summary_cache), probe.LATENCY_SUMMARY_CACHE_LIMIT)
+            self.assertIs(self.store.cached_latency_summary(['n'], healthy_ms=0, now=NOW), originals[0])
+            self.assertIsNot(self.store.cached_latency_summary(['n'], healthy_ms=1, now=NOW), originals[1])
+            self.assertEqual(len(self.store._latency_summary_cache), probe.LATENCY_SUMMARY_CACHE_LIMIT)
 
 
 def test_sqlite_disk_reopen_preserves_resource_rtt_and_manual_location(tmp_path):

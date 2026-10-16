@@ -6,6 +6,11 @@ venv/
 .env
 .env.*
 fleet-access.json
+onedrive-token.json
+.onedrive-token-*
+.onedrive-config-*
+.onedrive-auth-pending.json
+.onedrive-auth-*
 config.json
 inventory.json
 update-status.json

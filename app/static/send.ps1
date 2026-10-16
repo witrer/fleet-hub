@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Source,
     [Parameter(Mandatory = $true)][string]$Destination,
     [ValidateRange(1, 2147483647)][int]$ConnectTimeout = 180,
+    [ValidateSet('p2p', 'onedrive')][string]$Transport = 'p2p',
     [switch]$Overwrite
 )
 
@@ -12,7 +13,7 @@ $hub = '__HUB_URL__'
 $uvVersion = '0.13.1'
 $archiveHash = '3b2661a463a5baea7f5076ea2b25ab71d77f36a6c0d809e5350651792f80a672'
 $target = 'x86_64-pc-windows-msvc'
-$envNames = @('FLEET_TOKEN','UV_CACHE_DIR','UV_PYTHON_INSTALL_DIR','UV_PYTHON_BIN_DIR',
+$envNames = @('FLEET_TOKEN','FLEET_CLIENT_HOME','UV_CACHE_DIR','UV_PYTHON_INSTALL_DIR','UV_PYTHON_BIN_DIR',
     'UV_PYTHON_INSTALL_BIN','UV_PYTHON_NO_REGISTRY','UV_NO_MODIFY_PATH','UV_PYTHON_INSTALL_MIRROR','PYTHONUTF8')
 $savedEnvironment = @{}
 foreach ($name in $envNames) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
@@ -58,6 +59,43 @@ function Download-File([string]$Url, [string]$Path, [int]$Timeout = 300) {
     } finally { $ProgressPreference = $oldProgress }
 }
 
+function Update-TransferScript([string]$Path, [string]$TemporaryPath) {
+    $headers = @{}
+    if ((Test-Path -LiteralPath $Path -PathType Leaf) -and
+        -not ((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        $headers['If-None-Match'] = '"' + (Get-Sha256 $Path) + '"'
+    }
+    $oldProgress = $ProgressPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri ($hub + '/transfer.py') -Headers $headers -TimeoutSec 60
+            $status = [int]$response.StatusCode
+        } catch {
+            # Windows PowerShell reports 304 as an exception; PowerShell Core
+            # may return it normally. Both retain the stable cached script path.
+            if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 304) { $status = 304 }
+            else { throw }
+        }
+        if ($status -eq 200) {
+            # Do not combine -OutFile and -PassThru: older PowerShell versions
+            # can leave an empty file. Preserve the small script's original bytes.
+            $output = [IO.File]::Create($TemporaryPath)
+            try {
+                $response.RawContentStream.Position = 0
+                $response.RawContentStream.CopyTo($output)
+            } finally { $output.Dispose() }
+            if ((Get-Item -LiteralPath $TemporaryPath).Length -eq 0) { throw '中枢返回了空上传组件。' }
+            Move-Item -LiteralPath $TemporaryPath -Destination $Path -Force
+        } elseif ($status -eq 304) {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-Item -LiteralPath $Path).Length -eq 0 -or
+                ((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw '本地上传组件缓存不可用，请重试。'
+            }
+        } else { throw ('中枢上传组件响应异常: ' + $status) }
+    } finally { $ProgressPreference = $oldProgress }
+}
+
 try {
     if ($hub -notmatch '^https://' -and $hub -notmatch '^http://(?:127\.0\.0\.1|localhost):') {
         throw '启动脚本缺少有效中枢地址。'
@@ -79,6 +117,7 @@ try {
         }
     } else { New-Item -ItemType Directory -Path $clientRoot -Force | Out-Null }
     Set-PrivatePath $clientRoot $true
+    $env:FLEET_CLIENT_HOME = $clientRoot
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { $hubId = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($hub)))).Replace('-', '').ToLowerInvariant() }
     finally { $hasher.Dispose() }
@@ -130,9 +169,8 @@ try {
         Write-Utf8 $uvHashPath (Get-Sha256 $uvBinary)
     }
     $scriptTemp = Join-Path $scratch 'transfer.py'
-    Download-File ($hub + '/transfer.py') $scriptTemp 60
     $scriptPath = Join-Path $configDir 'transfer.py'
-    Move-Item -LiteralPath $scriptTemp -Destination $scriptPath -Force
+    Update-TransferScript $scriptPath $scriptTemp
     $env:UV_CACHE_DIR = Join-Path $clientRoot 'cache'
     $env:UV_PYTHON_INSTALL_DIR = Join-Path $clientRoot 'python'
     $env:UV_PYTHON_BIN_DIR = Join-Path $clientRoot 'python-bin'
@@ -142,7 +180,7 @@ try {
     $env:UV_PYTHON_INSTALL_MIRROR = 'https://gh-proxy.org/https://github.com/astral-sh/python-build-standalone/releases/download'
     $env:PYTHONUTF8 = '1'
     $runArguments = @('run','--no-config','--no-project','--managed-python','--python','3.12','--script',
-        $scriptPath,'--hub',$hub,'--node',$Node,'--source',$sourcePath,'--destination',$Destination,'--connect-timeout',"$ConnectTimeout")
+        $scriptPath,'--hub',$hub,'--node',$Node,'--source',$sourcePath,'--destination',$Destination,'--connect-timeout',"$ConnectTimeout",'--transport',$Transport.ToLowerInvariant())
     if ($Overwrite) { $runArguments += '--overwrite' }
     Write-Host '正在连接目标服务器并上传；运行环境和依赖会自动准备。'
     & $uvBinary @runArguments

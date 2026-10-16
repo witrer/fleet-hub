@@ -61,6 +61,7 @@ def git(*args, cwd=None):
 def main():
     root = Path(tempfile.mkdtemp(prefix='fleet-updater-e2e-'))
     checks = []
+    preparation_timings = {}
     try:
         bare, source = root / 'origin.git', root / 'source'
         git('init', '--bare', bare)
@@ -114,18 +115,37 @@ def main():
                'mcp_url': f'http://127.0.0.1:{port}/mcp', 'health_timeout': 2, 'health_interval': .1,
                'restart_command': [sys.executable, str(root / 'helper.py'), 'restart', str(root)],
                'lock_path': str(root / 'update.lock')}
-        def run(): return Updater(cfg).run()
+        pip_installs = []
+        class RecordedUpdater(Updater):
+            def command(self, args, **kwargs):
+                if args[1:4] == ['-m', 'pip', 'install']:
+                    pip_installs.append(args)
+                return super().command(args, **kwargs)
+        def run(): return RecordedUpdater(cfg).run()
         def state(): return json.loads((data / 'update-status.json').read_text())
         def count(): return int((root / 'restarts').read_text())
         assert run() == 0 and state()['current_commit'] == first and count() == 1
         assert (base / 'app/downloads').is_symlink()
         assert list((base / 'current/vendor').glob('relay_shell-*.dist-info'))
+        assert len(pip_installs) == 1 and state()['dependencies_reused'] is False
+        assert state()['prepare_seconds'] > 0
+        preparation_timings['offline_install_seconds'] = state()['prepare_seconds']
+        assert not (base / 'current/wheels').exists()
         checks.append('wheel installs offline and healthy commit passes real hub/MCP HTTP checks')
         assert run() == 0 and count() == 1
         checks.append('unchanged SHA does not restart services')
         broken = commit('bad', 'health fails')
         assert run() == 1 and state()['status'] == 'rolled_back' and count() == 3
         assert state()['current_commit'] == first and (base / 'current').resolve().name == first
+        assert len(pip_installs) == 1 and state()['dependencies_reused'] is True
+        preparation_timings['reuse_seconds'] = state()['prepare_seconds']
+        original = next((base / 'releases' / first / 'vendor').glob('relay_shell-*.dist-info/METADATA'))
+        copied = base / 'releases' / broken / 'vendor' / original.relative_to(original.parent.parent)
+        assert not os.path.samefile(original, copied)
+        previous_bytes = original.read_bytes()
+        copied.write_text('independent failed release\n')
+        assert original.read_bytes() == previous_bytes
+        checks.append('app-only commits skip pip; vendor files stay independent when health rolls back')
         assert run() == 0 and count() == 3 and state()['last_failed_commit'] == broken
         checks.append('bad health rolls back; failed SHA is not repeatedly redeployed')
         commit('good', 'syntax fails before activation', syntax=True)
@@ -139,6 +159,41 @@ def main():
         assert (data / 'runtime-marker').read_text() == 'preserve this'
         assert hashlib.sha256((base / 'app/downloads/archive.bin').read_bytes()).digest() == hashlib.sha256(payload).digest()
         checks.append('new commit recovers automatically; runtime data/downloads survive and old releases prune')
+        assert len(pip_installs) == 1 and state()['dependencies_reused'] is True
+        # Reuse must still check installed dependency metadata before activation.
+        active_metadata = next((base / 'current/vendor').glob('relay_shell-*.dist-info/METADATA'))
+        metadata_bytes = active_metadata.read_bytes()
+        try:
+            active_metadata.write_text('Requires-Dist: fleet-updater-missing-test-dependency>=1\n'
+                                       + metadata_bytes.decode())
+            commit('good', 'reject invalid cached dependencies')
+            assert run() == 1 and state()['status'] == 'failed' and count() == 4
+            assert (base / 'current').resolve().name == second and len(pip_installs) == 1
+            assert 'fleet-updater-missing-test-dependency' in state()['message']
+        finally:
+            active_metadata.write_bytes(metadata_bytes)
+        checks.append('reused vendor still receives dependency checks before activation')
+        # A changed wheels tree must invalidate reuse, even if the wheel names are unchanged.
+        (source / 'wheels/.gitkeep').write_text('dependency revision\n')
+        third = commit('good', 'changed dependency tree')
+        assert run() == 0 and count() == 5 and state()['current_commit'] == third
+        assert len(pip_installs) == 2 and state()['dependencies_reused'] is False
+        checks.append('a changed Git wheels tree forces a new offline install')
+        # Missing/older manifests and a different Python runtime are not reusable.
+        manifest_path = base / 'current/release.json'
+        manifest = json.loads(manifest_path.read_text())
+        updater = Updater(cfg)
+        assert updater.reusable_vendor(manifest['dependency_key']) == base / 'releases' / third / 'vendor'
+        assert updater.reusable_vendor(dict(manifest['dependency_key'], python=['another runtime'])) is None
+        manifest_path.write_text(json.dumps({'commit': third}))
+        assert updater.reusable_vendor(manifest['dependency_key']) is None
+        manifest_path.write_text(json.dumps(manifest))
+        # Even a valid key cannot let a shared writable symlink into a rollback release.
+        vendor_link = base / 'current/vendor/shared-link'
+        vendor_link.symlink_to(original.parent)
+        assert updater.reusable_vendor(manifest['dependency_key']) is None
+        vendor_link.unlink()
+        checks.append('legacy manifests, Python changes and symlinked vendor files disable reuse')
         interrupted = commit('bad', 'interrupted health check')
         cfg['health_timeout'] = 30
         config = root / 'config.json'
@@ -148,7 +203,7 @@ def main():
                                         '--config', str(config)], stdout=output, stderr=output)
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
-                if (base / 'current').resolve().name == interrupted and count() >= 5:
+                if (base / 'current').resolve().name == interrupted and count() >= 6:
                     break
                 if process.poll() is not None:
                     raise AssertionError('Updater exited before interruption test')
@@ -159,10 +214,10 @@ def main():
             time.sleep(.3)
             process.send_signal(signal.SIGTERM)
             assert process.wait(timeout=15) == 1
-        assert state()['status'] == 'rolled_back' and count() == 6
-        assert (base / 'current').resolve().name == second and Updater(cfg).healthy()
+        assert state()['status'] == 'rolled_back' and count() == 7
+        assert (base / 'current').resolve().name == third and Updater(cfg).healthy()
         checks.append('SIGTERM after activation restores the healthy previous release')
-        print(json.dumps({'ok': True, 'checks': checks}, indent=2))
+        print(json.dumps({'ok': True, 'checks': checks, 'preparation_timings': preparation_timings}, indent=2))
     except BaseException:
         print('Failed test artifacts: ' + str(root), file=sys.stderr)
         raise
