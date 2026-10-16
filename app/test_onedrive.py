@@ -334,6 +334,20 @@ def test_find_recovers_completed_upload_by_generated_name(provider):
     assert asyncio.run(provider(handle).find_item('test-name'))['id'] == 'test-item'
 
 
+@pytest.mark.parametrize('size', [0, 10])
+def test_find_needs_metadata_only_even_without_download_url(provider, size):
+    calls = []
+    def handle(request):
+        calls.append(request)
+        assert request.url.path.endswith('/items/test-folder:/test-name')
+        data = metadata(size=size)
+        del data['@microsoft.graph.downloadUrl']
+        return httpx.Response(200, json=data)
+    result = asyncio.run(provider(handle).find_item('test-name'))
+    assert result == {'id': 'test-item', 'name': 'test-name', 'size': size, 'etag': '"test-etag"'}
+    assert len(calls) == 1
+
+
 def test_empty_file_has_no_bytes_and_does_not_replace_existing_item(provider):
     def handle(request):
         assert request.method == 'PUT' and request.content == b''

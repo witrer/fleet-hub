@@ -273,25 +273,15 @@ class RelayTransfers:
                 return {'uploaded': True}
             if job['status'] != 'uploading':
                 raise HTTPException(409, 'Transfer is not accepting uploads')
-            item = await self.find(file)
-            if item is not None:
-                self.accept_item(task_id, file, item)
-                return {'uploaded': True}
-            if file['size'] == 0:
-                item = await self.call('create_empty', file['object_name'])
-                self.accept_item(task_id, file, item)
-                return {'uploaded': True}
-            if file['upload_url'] and file['upload_expires'] > time.time()+15:
+            # An active upload can expose a zero-byte placeholder under its final
+            # name. Reconcile the session before treating an object as complete.
+            # PUTs also extend the remote expiry without updating our cached time.
+            if file['upload_url']:
                 try:
                     current = await self.call('upload_status', file['upload_url'])
                 except HTTPException as exc:
                     if exc.status_code not in (404, 410):
                         raise
-                    # The final PUT may have committed despite a lost response.
-                    item = await self.find(file)
-                    if item is not None:
-                        self.accept_item(task_id, file, item)
-                        return {'uploaded': True}
                 else:
                     self.job(task_id, True)
                     ranges = current['next_expected_ranges']
@@ -304,6 +294,17 @@ class RelayTransfers:
                     self.db.execute('UPDATE relay_files SET upload_expires=? WHERE id=?', (current['expires_at'], file_id))
                     self.db.commit()
                     return dict(upload_url=file['upload_url'], expires_at=current['expires_at'], next_offset=offset)
+            # A missing session may mean the final PUT committed but its reply
+            # was lost. Keep strict validation; never accept or overwrite a
+            # remaining placeholder as a completed nonempty file.
+            item = await self.find(file)
+            if item is not None:
+                self.accept_item(task_id, file, item)
+                return {'uploaded': True}
+            if file['size'] == 0:
+                item = await self.call('create_empty', file['object_name'])
+                self.accept_item(task_id, file, item)
+                return {'uploaded': True}
             session = await self.call('create_upload', file['object_name'], file['size'])
             self.job(task_id, True)
             self.db.execute("UPDATE relay_files SET upload_url=?,upload_expires=?,status='uploading' WHERE id=?",

@@ -27,7 +27,9 @@ class Drive:
         url = 'https://upload.test/' + name + '?secret=synthetic-upload'
         self.sessions[url] = dict(expires_at=time.time()+3600, next_expected_ranges=['0-'])
         return dict(upload_url=url, expires_at=self.sessions[url]['expires_at'])
-    async def upload_status(self, url): return self.sessions[url]
+    async def upload_status(self, url):
+        if url not in self.sessions: raise ProviderError('not_found', 404)
+        return self.sessions[url]
     async def cancel_upload(self, url):
         if self.session_missing: raise ProviderError('not_found', 404)
         self.sessions.pop(url, None)
@@ -171,11 +173,86 @@ def test_session_resume_expiry_and_lost_final_response(relay):
     assert client.post(path, headers=ADMIN, json={}).json()['next_offset'] == 8
     module.db.execute('UPDATE relay_files SET upload_expires=0')
     module.db.commit()
+    # PUTs may extend the real lifetime beyond the hub's cached expiry.
+    assert client.post(path, headers=ADMIN, json={}).json()['next_offset'] == 8
+    provider.sessions.pop(session['upload_url'])
     assert client.post(path, headers=ADMIN, json={}).json()['next_offset'] == 0
     record = module.relay_transfers.file(job['id'], file['id'])
     provider.put(record['object_name'], file['size'])
     # Final OneDrive commit survived even though the client received no response.
+    provider.sessions.pop(session['upload_url'])
     assert client.post(path, headers=ADMIN, json={}).json() == {'uploaded': True}
+
+
+@pytest.mark.parametrize('size,offset', [(16, 8), (499 * 1024**2, 50 * 1024**2)])
+def test_session_resumes_past_zero_byte_placeholder(relay, monkeypatch, size, offset):
+    module, client, node, provider = relay
+    provider.remaining = size * 2
+    data = payload(node)
+    data['files'][0]['size'] = size
+    job = create(relay, data)
+    file = job['files'][0]
+    base = f"/api/relay/transfers/{job['id']}"
+    path = base + f"/files/{file['id']}/session"
+    initial = client.post(path, headers=ADMIN, json={}).json()
+    record = module.relay_transfers.file(job['id'], file['id'])
+    placeholder = provider.put(record['object_name'], 0)
+    provider.sessions[initial['upload_url']]['next_expected_ranges'] = [f'{offset}-']
+
+    async def unexpected_mutation(*args, **kwargs):
+        raise AssertionError('Resuming must preserve the active upload and placeholder')
+
+    for method in ('create_upload', 'cancel_upload', 'create_empty', 'permanent_delete'):
+        monkeypatch.setattr(provider, method, unexpected_mutation)
+
+    with monkeypatch.context() as active:
+        active.setattr(provider, 'find_item', unexpected_mutation)
+        response = client.post(path, headers=ADMIN, json={})
+    assert response.status_code == 200, response.text
+    assert response.json() == dict(initial, next_offset=offset)
+    resumed = module.relay_transfers.file(job['id'], file['id'])
+    assert resumed['upload_url'] == initial['upload_url']
+    assert resumed['item_id'] is None and resumed['status'] == 'uploading'
+    assert provider.items[record['object_name']] == placeholder
+    assert list(provider.sessions) == [initial['upload_url']]
+    assert provider.deleted == []
+    assert client.post(base+'/ready', headers=ADMIN, json={}).status_code == 409
+    assert client.post(base+f"/files/{file['id']}/complete", headers=ADMIN, json={}).status_code == 409
+    assert module.relay_transfers.job(job['id'])['status'] == 'uploading'
+    assert module.relay_transfers.file(job['id'], file['id'])['item_id'] is None
+
+
+@pytest.mark.parametrize('status', [404, 410, 429, 503])
+@pytest.mark.parametrize('size', [0, 15, 16])
+def test_session_errors_only_accept_complete_objects_after_session_is_gone(relay, monkeypatch, status, size):
+    module, client, _, provider = relay
+    job = create(relay)
+    file = job['files'][0]
+    path = f"/api/relay/transfers/{job['id']}/files/{file['id']}/session"
+    initial = client.post(path, headers=ADMIN, json={}).json()
+    record = module.relay_transfers.file(job['id'], file['id'])
+    provider.put(record['object_name'], size)
+
+    async def unavailable(url):
+        assert url == initial['upload_url']
+        raise ProviderError('session_unavailable', status)
+
+    async def unexpected_mutation(*args, **kwargs):
+        raise AssertionError('Session errors must not replace or delete an existing object')
+
+    monkeypatch.setattr(provider, 'upload_status', unavailable)
+    for method in ('create_upload', 'cancel_upload', 'create_empty', 'permanent_delete'):
+        monkeypatch.setattr(provider, method, unexpected_mutation)
+    response = client.post(path, headers=ADMIN, json={})
+    record = module.relay_transfers.file(job['id'], file['id'])
+    if status in (404, 410) and size == file['size']:
+        assert response.status_code == 200
+        assert response.json() == {'uploaded': True}
+        assert record['item_id'] is not None and record['upload_url'] is None
+    else:
+        assert response.status_code == (409 if status in (404, 410) else status)
+        assert record['item_id'] is None and record['upload_url'] == initial['upload_url']
+    assert provider.deleted == []
 
 
 def test_ready_requires_verified_cloud_object_not_client_progress(relay):

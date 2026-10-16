@@ -320,7 +320,8 @@ class OneDrive:
         return await self._metadata(self._item_path(item_id), expected_id=item_id)
 
     async def find_item(self, name):
-        return await self._metadata(self._child_path(name), expected_name=name)
+        # Upload placeholders need not have downloadable content yet.
+        return await self._metadata(self._child_path(name), expected_name=name, download=False)
 
     async def create_empty(self, name):
         name = _name(name)

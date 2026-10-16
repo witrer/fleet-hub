@@ -112,7 +112,7 @@ def publish(storage, name, size):
 @pytest.fixture
 def storage():
     state = {'items': {}, 'sessions': {}, 'bytes': {}, 'uploaded': 0, 'downloaded': 0,
-             'puts': [], 'gets': []}
+             'puts': [], 'gets': [], 'lose_first_reply': False, 'lost_upload_reply': False}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -145,6 +145,13 @@ def storage():
             state['bytes'][name] += data
             state['uploaded'] += len(data)
             session['offset'] = end + 1
+            if state['lose_first_reply'] and not state['lost_upload_reply'] and end + 1 < size:
+                # Graph may expose a zero-byte placeholder while the accepted
+                # first fragment remains available in its upload session.
+                publish(state, name, 0)
+                state['lost_upload_reply'] = True
+                self.close_connection = True
+                return
             if end + 1 == size:
                 self.json(201, publish(state, name, size))
             else:
@@ -244,9 +251,11 @@ def serve_hub(app):
         assert not thread.is_alive()
 
 
-@pytest.mark.parametrize('directory', [True, False], ids=['directory-with-empty-and-three-chunks', 'single-file'])
-def test_upload_hub_node_storage_contract(hub, storage, tmp_path, monkeypatch, directory):
+@pytest.mark.parametrize('directory,lose_first_reply', [(True, False), (False, False), (True, True)],
+                         ids=['directory-with-empty-and-three-chunks', 'single-file', 'resume-past-zero-byte-placeholder'])
+def test_upload_hub_node_storage_contract(hub, storage, tmp_path, monkeypatch, directory, lose_first_reply):
     module, client, _ = hub
+    storage['lose_first_reply'] = lose_first_reply
     registered = client.post('/api/enroll', headers=grant(client), json=body()).json()
     beat = client.post('/api/nodes/' + registered['id'] + '/heartbeat',
                        headers={'Authorization': 'Bearer ' + registered['token']}, json={'relay_protocol': 1})
@@ -315,6 +324,12 @@ def test_upload_hub_node_storage_contract(hub, storage, tmp_path, monkeypatch, d
             assert len(storage['puts']) == 3
         else:
             assert len(storage['puts']) == 1
+        if lose_first_reply:
+            assert storage['lost_upload_reply']
+            assert [start for _, start, _ in storage['puts']] == [0, BLOCK, BLOCK * 2]
+            assert provider.calls.count('create_upload') == 1
+            assert provider.calls.count('upload_status') == 1
+            assert 'cancel_upload' not in provider.calls
         state = uploader.relay_api(origin, '/api/state', 'synthetic-admin-token')
         public = json.dumps(state)
         assert CAPABILITY not in public and STORAGE_ORIGIN not in public
